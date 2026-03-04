@@ -160,16 +160,16 @@ Docker 提供跨平台支持（macOS 和 Linux）和成熟的生态系统。在 
 可以。NanoClaw 支持任何 API 兼容的模型端点。在 `.env` 文件中设置以下环境变量：
 
 ```bash
-ANTHROPIC_BASE_URL=https://your-api-endpoint.com
-ANTHROPIC_AUTH_TOKEN=your-token-here
+OPENAI_API_KEY=your-token-here
+OPENAI_BASE_URL=https://your-api-endpoint.com
 ```
 
 这使您能够使用：
 - 通过 [Ollama](https://ollama.ai) 配合 API 代理运行的本地模型
 - 托管在 [Together AI](https://together.ai)、[Fireworks](https://fireworks.ai) 等平台上的开源模型
-- 兼容 Anthropic API 格式的自定义模型部署
+- 兼容 OpenAI API 格式的自定义模型部署
 
-注意：为获得最佳兼容性，模型需支持 Anthropic API 格式。
+注意：为获得最佳兼容性，模型需支持 OpenAI API 格式。
 
 **我该如何调试问题？**
 

@@ -163,16 +163,16 @@ We don't want configuration sprawl. Every user should customize NanoClaw so that
 Yes. NanoClaw supports any API-compatible model endpoint. Set these environment variables in your `.env` file:
 
 ```bash
-ANTHROPIC_BASE_URL=https://your-api-endpoint.com
-ANTHROPIC_AUTH_TOKEN=your-token-here
+OPENAI_API_KEY=your-token-here
+OPENAI_BASE_URL=https://your-api-endpoint.com
 ```
 
 This allows you to use:
 - Local models via [Ollama](https://ollama.ai) with an API proxy
 - Open-source models hosted on [Together AI](https://together.ai), [Fireworks](https://fireworks.ai), etc.
-- Custom model deployments with Anthropic-compatible APIs
+- Custom model deployments with OpenAI-compatible APIs
 
-Note: The model must support the Anthropic API format for best compatibility.
+Note: The model endpoint must support the OpenAI API format for best compatibility.
 
 **How do I debug issues?**
 
