@@ -64,7 +64,7 @@ function buildVolumeMounts(
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
-    // (group folder, IPC, .codex/) are mounted separately below.
+    // (group folder, IPC, .claude/) are mounted separately below.
     // Read-only prevents the agent from modifying host application code
     // (src/, dist/, package.json, etc.) which would bypass the sandbox
     // entirely on next restart.
@@ -73,39 +73,6 @@ function buildVolumeMounts(
       containerPath: '/workspace/project',
       readonly: true,
     });
-
-    // Hide host-side developer instructions from container agents.
-    const agentsFile = path.join(projectRoot, 'AGENTS.md');
-    if (fs.existsSync(agentsFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/AGENTS.md',
-        readonly: true,
-      });
-    }
-
-    // Hide host-side skill implementation details from container agents.
-    const agentsDir = path.join(projectRoot, '.agents');
-    if (fs.existsSync(agentsDir)) {
-      const maskedAgentsDir = path.join(DATA_DIR, 'masked', '.agents');
-      fs.mkdirSync(maskedAgentsDir, { recursive: true });
-      mounts.push({
-        hostPath: maskedAgentsDir,
-        containerPath: '/workspace/project/.agents',
-        readonly: true,
-      });
-    }
-
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Secrets are passed via stdin instead (see readSecrets()).
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
 
     // Main also gets its group folder as the working directory
     mounts.push({
@@ -133,27 +100,40 @@ function buildVolumeMounts(
     }
   }
 
-  // Mount SOUL.md into each group's workspace as the primary identity card.
-  const soulFile = path.join(projectRoot, 'SOUL.md');
-  if (fs.existsSync(soulFile)) {
-    mounts.push({
-      hostPath: soulFile,
-      containerPath: '/workspace/group/SOUL.md',
-      readonly: true,
-    });
-  }
-
-  // Per-group Codex state directory (isolated from other groups)
-  // Each group gets their own .codex/ to prevent cross-group session access
+  // Per-group Claude sessions directory (isolated from other groups)
+  // Each group gets their own .claude/ to prevent cross-group session access
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
     group.folder,
-    '.codex',
+    '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  const settingsFile = path.join(groupSessionsDir, 'settings.json');
+  if (!fs.existsSync(settingsFile)) {
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify(
+        {
+          env: {
+            // Enable agent swarms (subagent orchestration)
+            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+            // Load CLAUDE.md from additional mounted directories
+            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+            // Enable Claude's memory feature (persists user preferences between sessions)
+            // https://code.claude.com/docs/en/memory#manage-auto-memory
+            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  }
 
-  // Sync skills from container/skills/ into each group's .codex/skills/
+  // Sync skills from container/skills/ into each group's .agents/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
@@ -166,7 +146,7 @@ function buildVolumeMounts(
   }
   mounts.push({
     hostPath: groupSessionsDir,
-    containerPath: '/home/node/.codex',
+    containerPath: '/home/node/.claude',
     readonly: false,
   });
 
@@ -224,22 +204,13 @@ function buildVolumeMounts(
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile([
-    'OPENAI_API_KEY',
-    'CODEX_API_KEY',
-    'OPENAI_BASE_URL',
-    'OPENAI_ORG_ID',
-    'OPENAI_PROJECT',
-    // Keep legacy variables for local shim compatibility during migration.
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_AUTH_TOKEN',
-  ]);
+  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
 }
 
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  isMain: boolean,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -252,7 +223,14 @@ function buildContainerArgs(
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
+    if (isMain) {
+      // Main containers start as root so the entrypoint can mount --bind
+      // to shadow .env. Privileges are dropped via setpriv in entrypoint.sh.
+      args.push('-e', `RUN_UID=${hostUid}`);
+      args.push('-e', `RUN_GID=${hostGid}`);
+    } else {
+      args.push('--user', `${hostUid}:${hostGid}`);
+    }
     args.push('-e', 'HOME=/home/node');
   }
 
@@ -283,7 +261,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, input.isMain);
 
   logger.debug(
     {

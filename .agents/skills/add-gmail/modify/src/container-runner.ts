@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -18,11 +19,7 @@ import {
 import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
-import {
-  CONTAINER_RUNTIME_BIN,
-  readonlyMountArgs,
-  stopContainer,
-} from './container-runtime.js';
+import { CONTAINER_RUNTIME_BIN, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -60,11 +57,12 @@ function buildVolumeMounts(
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
+  const homeDir = os.homedir();
   const groupDir = resolveGroupFolderPath(group.folder);
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
-    // (group folder, IPC, .codex/) are mounted separately below.
+    // (group folder, IPC, .claude/) are mounted separately below.
     // Read-only prevents the agent from modifying host application code
     // (src/, dist/, package.json, etc.) which would bypass the sandbox
     // entirely on next restart.
@@ -73,39 +71,6 @@ function buildVolumeMounts(
       containerPath: '/workspace/project',
       readonly: true,
     });
-
-    // Hide host-side developer instructions from container agents.
-    const agentsFile = path.join(projectRoot, 'AGENTS.md');
-    if (fs.existsSync(agentsFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/AGENTS.md',
-        readonly: true,
-      });
-    }
-
-    // Hide host-side skill implementation details from container agents.
-    const agentsDir = path.join(projectRoot, '.agents');
-    if (fs.existsSync(agentsDir)) {
-      const maskedAgentsDir = path.join(DATA_DIR, 'masked', '.agents');
-      fs.mkdirSync(maskedAgentsDir, { recursive: true });
-      mounts.push({
-        hostPath: maskedAgentsDir,
-        containerPath: '/workspace/project/.agents',
-        readonly: true,
-      });
-    }
-
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Secrets are passed via stdin instead (see readSecrets()).
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
 
     // Main also gets its group folder as the working directory
     mounts.push({
@@ -133,27 +98,33 @@ function buildVolumeMounts(
     }
   }
 
-  // Mount SOUL.md into each group's workspace as the primary identity card.
-  const soulFile = path.join(projectRoot, 'SOUL.md');
-  if (fs.existsSync(soulFile)) {
-    mounts.push({
-      hostPath: soulFile,
-      containerPath: '/workspace/group/SOUL.md',
-      readonly: true,
-    });
-  }
-
-  // Per-group Codex state directory (isolated from other groups)
-  // Each group gets their own .codex/ to prevent cross-group session access
+  // Per-group Claude sessions directory (isolated from other groups)
+  // Each group gets their own .claude/ to prevent cross-group session access
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
     group.folder,
-    '.codex',
+    '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  const settingsFile = path.join(groupSessionsDir, 'settings.json');
+  if (!fs.existsSync(settingsFile)) {
+    fs.writeFileSync(settingsFile, JSON.stringify({
+      env: {
+        // Enable agent swarms (subagent orchestration)
+        // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+        // Load CLAUDE.md from additional mounted directories
+        // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+        CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+        // Enable Claude's memory feature (persists user preferences between sessions)
+        // https://code.claude.com/docs/en/memory#manage-auto-memory
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+      },
+    }, null, 2) + '\n');
+  }
 
-  // Sync skills from container/skills/ into each group's .codex/skills/
+  // Sync skills from container/skills/ into each group's .agents/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
@@ -166,9 +137,19 @@ function buildVolumeMounts(
   }
   mounts.push({
     hostPath: groupSessionsDir,
-    containerPath: '/home/node/.codex',
+    containerPath: '/home/node/.claude',
     readonly: false,
   });
+
+  // Gmail credentials directory (for Gmail MCP inside the container)
+  const gmailDir = path.join(homeDir, '.gmail-mcp');
+  if (fs.existsSync(gmailDir)) {
+    mounts.push({
+      hostPath: gmailDir,
+      containerPath: '/home/node/.gmail-mcp',
+      readonly: false, // MCP may need to refresh OAuth tokens
+    });
+  }
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -185,18 +166,8 @@ function buildVolumeMounts(
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh.
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
+  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
+  const groupAgentRunnerDir = path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
   if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
@@ -224,23 +195,10 @@ function buildVolumeMounts(
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile([
-    'OPENAI_API_KEY',
-    'CODEX_API_KEY',
-    'OPENAI_BASE_URL',
-    'OPENAI_ORG_ID',
-    'OPENAI_PROJECT',
-    // Keep legacy variables for local shim compatibility during migration.
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_AUTH_TOKEN',
-  ]);
+  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
 }
 
-function buildContainerArgs(
-  mounts: VolumeMount[],
-  containerName: string,
-): string[] {
+function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
@@ -418,16 +376,10 @@ export async function runContainerAgent(
 
     const killOnTimeout = () => {
       timedOut = true;
-      logger.error(
-        { group: group.name, containerName },
-        'Container timeout, stopping gracefully',
-      );
+      logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
       exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
         if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
+          logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');
         }
       });
@@ -448,18 +400,15 @@ export async function runContainerAgent(
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
-        fs.writeFileSync(
-          timeoutLog,
-          [
-            `=== Container Run Log (TIMEOUT) ===`,
-            `Timestamp: ${new Date().toISOString()}`,
-            `Group: ${group.name}`,
-            `Container: ${containerName}`,
-            `Duration: ${duration}ms`,
-            `Exit Code: ${code}`,
-            `Had Streaming Output: ${hadStreamingOutput}`,
-          ].join('\n'),
-        );
+        fs.writeFileSync(timeoutLog, [
+          `=== Container Run Log (TIMEOUT) ===`,
+          `Timestamp: ${new Date().toISOString()}`,
+          `Group: ${group.name}`,
+          `Container: ${containerName}`,
+          `Duration: ${duration}ms`,
+          `Exit Code: ${code}`,
+          `Had Streaming Output: ${hadStreamingOutput}`,
+        ].join('\n'));
 
         // Timeout after output = idle cleanup, not failure.
         // The agent already sent its response; this is just the
@@ -494,8 +443,7 @@ export async function runContainerAgent(
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const logFile = path.join(logsDir, `container-${timestamp}.log`);
-      const isVerbose =
-        process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
+      const isVerbose = process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
 
       const logLines = [
         `=== Container Run Log ===`,
@@ -638,10 +586,7 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
-      logger.error(
-        { group: group.name, containerName, error: err },
-        'Container spawn error',
-      );
+      logger.error({ group: group.name, containerName, error: err }, 'Container spawn error');
       resolve({
         status: 'error',
         result: null,

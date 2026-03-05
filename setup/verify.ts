@@ -89,8 +89,14 @@ export async function run(_args: string[]): Promise<void> {
     containerRuntime = 'apple-container';
   } catch {
     try {
-      execSync('docker info', { stdio: 'ignore' });
+      execSync('command -v docker', { stdio: 'ignore' });
       containerRuntime = 'docker';
+      try {
+        execSync('docker info', { stdio: 'ignore' });
+      } catch {
+        // Docker is installed but not reachable in this shell/session.
+        containerRuntime = 'docker_unreachable';
+      }
     } catch {
       // No runtime
     }
@@ -98,12 +104,23 @@ export async function run(_args: string[]): Promise<void> {
 
   // 3. Check credentials
   let credentials = 'missing';
-  const envFile = path.join(projectRoot, '.env');
-  if (fs.existsSync(envFile)) {
-    const envContent = fs.readFileSync(envFile, 'utf-8');
-    if (/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=/m.test(envContent)) {
-      credentials = 'configured';
-    }
+  const authVars = readEnvFile([
+    'CODEX_API_KEY',
+    'OPENAI_API_KEY',
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+  ]);
+  if (
+    process.env.CODEX_API_KEY ||
+    authVars.CODEX_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    authVars.OPENAI_API_KEY ||
+    process.env.CLAUDE_CODE_OAUTH_TOKEN ||
+    authVars.CLAUDE_CODE_OAUTH_TOKEN ||
+    process.env.ANTHROPIC_API_KEY ||
+    authVars.ANTHROPIC_API_KEY
+  ) {
+    credentials = 'configured';
   }
 
   // 4. Check channel auth (detect configured channels by credentials)

@@ -180,13 +180,49 @@ function ensureCodexConfig(
 function loadGlobalContext(containerInput: ContainerInput): string {
   const context: string[] = [];
 
+  const localSoulPath = '/workspace/group/SOUL.md';
+  if (fs.existsSync(localSoulPath)) {
+    context.push('[SOUL]', fs.readFileSync(localSoulPath, 'utf-8'));
+  }
+
+  // Backward-compatible fallback for existing installs still using CLAUDE.md.
+  const localClaudePath = '/workspace/group/CLAUDE.md';
+  if (!fs.existsSync(localSoulPath) && fs.existsSync(localClaudePath)) {
+    context.push('[LOCAL CONTEXT]', fs.readFileSync(localClaudePath, 'utf-8'));
+  }
+
   if (!containerInput.isMain) {
-    const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-    if (fs.existsSync(globalClaudeMdPath)) {
+    const globalSoulPath = '/workspace/global/SOUL.md';
+    if (fs.existsSync(globalSoulPath)) {
       context.push(
         '[GLOBAL PROJECT CONTEXT]',
-        fs.readFileSync(globalClaudeMdPath, 'utf-8'),
+        fs.readFileSync(globalSoulPath, 'utf-8'),
       );
+    } else {
+      const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+      if (fs.existsSync(globalClaudeMdPath)) {
+        context.push(
+          '[GLOBAL PROJECT CONTEXT]',
+          fs.readFileSync(globalClaudeMdPath, 'utf-8'),
+        );
+      }
+    }
+  } else {
+    // Main has project root mounted read-only; load global soul from there.
+    const projectGlobalSoul = '/workspace/project/groups/global/SOUL.md';
+    if (fs.existsSync(projectGlobalSoul)) {
+      context.push(
+        '[GLOBAL PROJECT CONTEXT]',
+        fs.readFileSync(projectGlobalSoul, 'utf-8'),
+      );
+    } else {
+      const projectGlobalClaude = '/workspace/project/groups/global/CLAUDE.md';
+      if (fs.existsSync(projectGlobalClaude)) {
+        context.push(
+          '[GLOBAL PROJECT CONTEXT]',
+          fs.readFileSync(projectGlobalClaude, 'utf-8'),
+        );
+      }
     }
   }
 
@@ -196,10 +232,19 @@ function loadGlobalContext(containerInput: ContainerInput): string {
       const fullPath = path.join(extraBase, entry);
       if (!fs.statSync(fullPath).isDirectory()) continue;
 
+      const extraSoulPath = path.join(fullPath, 'SOUL.md');
       const extraClaudePath = path.join(fullPath, 'CLAUDE.md');
-      if (!fs.existsSync(extraClaudePath)) continue;
-
-      context.push(`[EXTRA CONTEXT: ${entry}]`, fs.readFileSync(extraClaudePath, 'utf-8'));
+      if (fs.existsSync(extraSoulPath)) {
+        context.push(
+          `[EXTRA CONTEXT: ${entry}]`,
+          fs.readFileSync(extraSoulPath, 'utf-8'),
+        );
+      } else if (fs.existsSync(extraClaudePath)) {
+        context.push(
+          `[EXTRA CONTEXT: ${entry}]`,
+          fs.readFileSync(extraClaudePath, 'utf-8'),
+        );
+      }
     }
   }
 
