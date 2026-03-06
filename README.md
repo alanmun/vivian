@@ -7,26 +7,18 @@
 </p>
 
 <p align="center">
-  <a href="https://nanoclaw.dev">nanoclaw.dev</a>&nbsp; • &nbsp;
   <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
-  <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
   <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
 </p>
 Using Codex, NanoClaw can dynamically rewrite its code to customize its feature set for your needs.
 
 **New:** First AI assistant to support agent swarms. Spin up teams of agents that collaborate in your chat.
 
-## Why I Built NanoClaw
-
-[OpenClaw](https://github.com/openclaw/openclaw) is an impressive project, but I wouldn't have been able to sleep if I had given complex software I didn't understand full access to my life. OpenClaw has nearly half a million lines of code, 53 config files, and 70+ dependencies. Its security is at the application level (allowlists, pairing codes) rather than true OS-level isolation. Everything runs in one Node process with shared memory.
-
-NanoClaw provides that same core functionality, but in a codebase small enough to understand: one process and a handful of files. Agents run in their own Linux containers with filesystem isolation, not merely behind permission checks.
-
 ## Quick Start
 
 ```bash
-git clone https://github.com/qwibitai/NanoClaw.git
-cd NanoClaw
+git clone <your-repo-url>
+cd vivian-codex-agent-sdk-migration
 bash setup.sh
 npx tsx setup/index.ts --step environment
 npx tsx setup/index.ts --step container -- --runtime docker
@@ -68,19 +60,19 @@ Then have Codex run the setup flow in `.agents/skills/setup/SKILL.md`, or run th
 
 ## Usage
 
-Talk to your assistant with the trigger word (default: `@Andy`):
+Talk to your assistant with the trigger word (default: `@Vivian`):
 
 ```
-@Andy send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
-@Andy review the git history for the past week each Friday and update the README if there's drift
-@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
+@Vivian send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
+@Vivian review the git history for the past week each Friday and update the README if there's drift
+@Vivian every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
 ```
 
 From the main channel (your self-chat), you can manage groups and tasks:
 ```
-@Andy list all scheduled tasks across groups
-@Andy pause the Monday briefing task
-@Andy join the Family Chat group
+@Vivian list all scheduled tasks across groups
+@Vivian pause the Monday briefing task
+@Vivian join the Family Chat group
 ```
 
 ### Run and Control NanoClaw
@@ -155,7 +147,7 @@ Skills we'd like to see:
 - macOS or Linux
 - Node.js 20+
 - Codex CLI (host-side, optional but recommended for guided setup/customization)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+- Apple Container (macOS) or Docker (macOS/Linux)
 
 ## Architecture
 
@@ -165,7 +157,7 @@ Channels --> SQLite --> Polling loop --> Container (Codex runtime) --> Response
 
 Single Node.js process. Channels are added via skills and self-register at startup — the orchestrator connects whichever ones have credentials present. Agents execute in isolated Linux containers with filesystem isolation. Only mounted directories are accessible. Per-group message queue with concurrency control. IPC via filesystem.
 
-For the full architecture details, see [docs/SPEC.md](docs/SPEC.md).
+For the full architecture details, see `docs/SPEC.md`.
 
 Key files:
 - `src/index.ts` - Orchestrator: state, message loop, agent invocation
@@ -191,7 +183,7 @@ Yes. Docker is the default runtime and works on both macOS and Linux. Run the se
 
 **Is this secure?**
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
+Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See `docs/SECURITY.md` for the full security model.
 
 **Why no configuration files?**
 
@@ -207,8 +199,8 @@ OPENAI_BASE_URL=https://your-api-endpoint.com
 ```
 
 This allows you to use:
-- Local models via [Ollama](https://ollama.ai) with an API proxy
-- Open-source models hosted on [Together AI](https://together.ai), [Fireworks](https://fireworks.ai), etc.
+- Local models via Ollama with an API proxy
+- Open-source models hosted on Together AI, Fireworks, etc.
 - Custom model deployments with OpenAI-compatible APIs
 
 Note: The model endpoint must support the OpenAI API format for best compatibility.
@@ -229,13 +221,9 @@ Everything else (new capabilities, OS compatibility, hardware support, enhanceme
 
 This keeps the base system minimal and lets every user customize their installation without inheriting features they don't want.
 
-## Community
-
-Questions? Ideas? [Join the Discord](https://discord.gg/VDdww8qS42).
-
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for breaking changes and migration notes.
+See `CHANGELOG.md` for breaking changes and migration notes.
 
 ## License
 
