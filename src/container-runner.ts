@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -52,6 +53,19 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+function expandHomeDir(value: string): string {
+  if (value === '~') return os.homedir();
+  if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
+  return value;
+}
+
+function resolveGwsHostConfigPath(): string {
+  const envConfig = readEnvFile(['GWS_CONFIG_DIR']);
+  const configuredPath = envConfig.GWS_CONFIG_DIR?.trim();
+  const defaultPath = path.join(os.homedir(), '.config', 'gws');
+  return path.resolve(expandHomeDir(configuredPath || defaultPath));
 }
 
 function buildVolumeMounts(
@@ -171,6 +185,17 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Google Workspace CLI OAuth state (tokens/accounts) for gws MCP server.
+  // Mount read-write so token refresh can persist back to host.
+  const gwsConfigDir = resolveGwsHostConfigPath();
+  if (fs.existsSync(gwsConfigDir) && fs.statSync(gwsConfigDir).isDirectory()) {
+    mounts.push({
+      hostPath: gwsConfigDir,
+      containerPath: '/home/node/.config/gws',
+      readonly: false,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -246,6 +271,13 @@ function readSecrets(): Record<string, string> {
     'OPENAI_BASE_URL',
     'OPENAI_ORG_ID',
     'OPENAI_PROJECT',
+    'GOOGLE_WORKSPACE_CLI_ACCOUNT',
+    'GOOGLE_WORKSPACE_CLI_CLIENT_ID',
+    'GOOGLE_WORKSPACE_CLI_CLIENT_SECRET',
+    'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE',
+    'GOOGLE_WORKSPACE_CLI_TOKEN',
+    'GWS_MCP_SERVICES',
+    'NANOCLAW_ENABLE_GWS_MCP',
   ]);
 }
 

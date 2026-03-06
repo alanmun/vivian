@@ -198,6 +198,7 @@ function ensureCodexConfig(
   codexHome: string,
   mcpServerPath: string,
   containerInput: ContainerInput,
+  codexEnv: Record<string, string>,
 ): void {
   fs.mkdirSync(codexHome, { recursive: true });
 
@@ -221,7 +222,7 @@ function ensureCodexConfig(
   const monitorConfigPath = writeAgentRoleConfig('monitor');
 
   const configPath = path.join(codexHome, 'config.toml');
-  const config = [
+  const configLines = [
     'model = "gpt-5.4"',
     'model_reasoning_effort = "high"',
     'personality = "friendly"',
@@ -253,7 +254,48 @@ function ensureCodexConfig(
     `NANOCLAW_GROUP_FOLDER = ${tomlString(containerInput.groupFolder)}`,
     `NANOCLAW_IS_MAIN = ${tomlString(containerInput.isMain ? '1' : '0')}`,
     '',
-  ].join('\n');
+  ];
+
+  const enableGwsMcp = codexEnv.NANOCLAW_ENABLE_GWS_MCP !== '0';
+  if (enableGwsMcp) {
+    const gwsServices = codexEnv.GWS_MCP_SERVICES || 'gmail,calendar,drive';
+    configLines.push(
+      '[mcp_servers.gws]',
+      `command = ${tomlString('gws')}`,
+      `args = [${tomlString('mcp')}, ${tomlString('-s')}, ${tomlString(gwsServices)}]`,
+      'required = false',
+      '',
+    );
+
+    const gwsEnv = [
+      ['GOOGLE_WORKSPACE_CLI_ACCOUNT', codexEnv.GOOGLE_WORKSPACE_CLI_ACCOUNT],
+      [
+        'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE',
+        codexEnv.GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE,
+      ],
+      [
+        'GOOGLE_WORKSPACE_CLI_CLIENT_ID',
+        codexEnv.GOOGLE_WORKSPACE_CLI_CLIENT_ID,
+      ],
+      [
+        'GOOGLE_WORKSPACE_CLI_CLIENT_SECRET',
+        codexEnv.GOOGLE_WORKSPACE_CLI_CLIENT_SECRET,
+      ],
+      ['GOOGLE_WORKSPACE_CLI_TOKEN', codexEnv.GOOGLE_WORKSPACE_CLI_TOKEN],
+    ].filter(([, value]) => typeof value === 'string' && value.trim() !== '');
+
+    if (gwsEnv.length > 0) {
+      configLines.push('[mcp_servers.gws.env]');
+      for (const [key, value] of gwsEnv) {
+        configLines.push(`${key} = ${tomlString(value as string)}`);
+      }
+      configLines.push('');
+    }
+
+    log(`Configured gws MCP server (services: ${gwsServices})`);
+  }
+
+  const config = configLines.join('\n');
 
   fs.writeFileSync(configPath, config);
   log(`Wrote Codex config: ${configPath}`);
@@ -602,7 +644,12 @@ async function main(): Promise<void> {
   codexEnv.CODEX_HOME = '/home/node/.codex';
 
   const mcpServerPath = '/app/dist/ipc-mcp-stdio.js';
-  ensureCodexConfig(codexEnv.CODEX_HOME, mcpServerPath, containerInput);
+  ensureCodexConfig(
+    codexEnv.CODEX_HOME,
+    mcpServerPath,
+    containerInput,
+    codexEnv,
+  );
 
   const globalContext = loadGlobalContext(containerInput);
 
