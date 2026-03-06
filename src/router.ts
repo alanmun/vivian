@@ -1,5 +1,8 @@
 import { Channel, NewMessage } from './types.js';
 
+const CITE_BLOCK_RE = /\uE200cite\uE202[\s\S]*?\uE201/g;
+const CITE_CONTROL_CHARS_RE = /[\uE200\uE201\uE202]/g;
+
 export function escapeXml(s: string): string {
   if (!s) return '';
   return s
@@ -21,8 +24,15 @@ export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
 
+export function stripCitationMarkers(text: string): string {
+  return text
+    .replace(CITE_BLOCK_RE, '')
+    .replace(CITE_CONTROL_CHARS_RE, '')
+    .trim();
+}
+
 export function formatOutbound(rawText: string): string {
-  const text = stripInternalTags(rawText);
+  const text = stripCitationMarkers(stripInternalTags(rawText));
   if (!text) return '';
   return text;
 }

@@ -5,6 +5,7 @@ import {
   escapeXml,
   formatMessages,
   formatOutbound,
+  stripCitationMarkers,
   stripInternalTags,
 } from './router.js';
 import { NewMessage } from './types.js';
@@ -181,6 +182,28 @@ describe('formatOutbound', () => {
     expect(
       formatOutbound('<internal>thinking</internal>The answer is 42'),
     ).toBe('The answer is 42');
+  });
+
+  it('strips leaked citation marker blocks', () => {
+    expect(
+      formatOutbound(
+        'Use this approach. \uE200cite\uE202turn1open5\uE202turn1open9\uE201',
+      ),
+    ).toBe('Use this approach.');
+  });
+
+  it('strips multiple citation marker blocks', () => {
+    expect(
+      formatOutbound(
+        'A \uE200cite\uE202x\uE201 B \uE200cite\uE202y\uE201 C',
+      ),
+    ).toBe('A  B  C');
+  });
+});
+
+describe('stripCitationMarkers', () => {
+  it('strips standalone control chars if present', () => {
+    expect(stripCitationMarkers('hello \uE200world\uE201')).toBe('hello world');
   });
 });
 
