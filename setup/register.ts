@@ -152,8 +152,6 @@ export async function run(args: string[]): Promise<void> {
       path.join(projectRoot, 'SOUL.md'),
       path.join(projectRoot, 'groups', 'global', 'SOUL.md'),
       path.join(projectRoot, 'groups', parsed.folder, 'SOUL.md'),
-      path.join(projectRoot, 'groups', 'global', 'CLAUDE.md'),
-      path.join(projectRoot, 'groups', parsed.folder, 'CLAUDE.md'),
     ];
 
     for (const mdFile of mdFiles) {
@@ -165,7 +163,7 @@ export async function run(args: string[]): Promise<void> {
           `You are ${parsed.assistantName}`,
         );
         fs.writeFileSync(mdFile, content);
-        logger.info({ file: mdFile }, 'Updated CLAUDE.md');
+        logger.info({ file: mdFile }, 'Updated SOUL.md');
       }
     }
 

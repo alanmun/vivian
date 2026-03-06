@@ -133,12 +133,13 @@ function buildVolumeMounts(
     }
   }
 
-  // Mount SOUL.md into each group's workspace as the primary identity card.
+  // Mount top-level SOUL.md as shared base identity.
+  // Group-specific /workspace/group/SOUL.md is loaded as per-group overrides.
   const soulFile = path.join(projectRoot, 'SOUL.md');
   if (fs.existsSync(soulFile)) {
     mounts.push({
       hostPath: soulFile,
-      containerPath: '/workspace/group/SOUL.md',
+      containerPath: '/workspace/default/SOUL.md',
       readonly: true,
     });
   }
@@ -182,6 +183,17 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Shared audit log directory across all groups. Agent-runner appends
+  // verbose per-day logs here so human operators can review all activity
+  // (inputs, tool events, outputs) in one sequential stream.
+  const auditDir = path.join(DATA_DIR, 'vivian-audit');
+  fs.mkdirSync(auditDir, { recursive: true });
+  mounts.push({
+    hostPath: auditDir,
+    containerPath: '/workspace/audit',
+    readonly: false,
+  });
+
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh.
@@ -197,8 +209,12 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  if (fs.existsSync(agentRunnerSrc)) {
+    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
+    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, {
+      recursive: true,
+      force: true,
+    });
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -230,10 +246,6 @@ function readSecrets(): Record<string, string> {
     'OPENAI_BASE_URL',
     'OPENAI_ORG_ID',
     'OPENAI_PROJECT',
-    // Keep legacy variables for local shim compatibility during migration.
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_AUTH_TOKEN',
   ]);
 }
 

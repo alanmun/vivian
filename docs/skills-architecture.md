@@ -2,15 +2,15 @@
 
 ## Core Principle
 
-Skills are self-contained, auditable packages that apply programmatically via standard git merge mechanics. Claude Code orchestrates the process — running git commands, reading skill manifests, and stepping in only when git can't resolve a conflict on its own. The system uses existing git features (`merge-file`, `rerere`, `apply`) rather than custom merge infrastructure.
+Skills are self-contained, auditable packages that apply programmatically via standard git merge mechanics. Codex orchestrates the process — running git commands, reading skill manifests, and stepping in only when git can't resolve a conflict on its own. The system uses existing git features (`merge-file`, `rerere`, `apply`) rather than custom merge infrastructure.
 
 ### The Three-Level Resolution Model
 
 Every operation in the system follows this escalation:
 
 1. **Git** — deterministic, programmatic. `git merge-file` merges, `git rerere` replays cached resolutions, structured operations apply without merging. No AI involved. This handles the vast majority of cases.
-2. **Claude Code** — reads `SKILL.md`, `.intent.md`, migration guides, and `state.yaml` to understand context. Resolves conflicts that git can't handle programmatically. Caches the resolution via `git rerere` so it never needs to resolve the same conflict again.
-3. **User** — Claude Code asks the user when it lacks context or intent. This happens when two features genuinely conflict at an application level (not just a text-level merge conflict) and a human decision is needed about desired behavior.
+2. **Codex** — reads `SKILL.md`, `.intent.md`, migration guides, and `state.yaml` to understand context. Resolves conflicts that git can't handle programmatically. Caches the resolution via `git rerere` so it never needs to resolve the same conflict again.
+3. **User** — Codex asks the user when it lacks context or intent. This happens when two features genuinely conflict at an application level (not just a text-level merge conflict) and a human decision is needed about desired behavior.
 
 The goal is that Level 1 handles everything on a mature, well-tested installation. Level 2 handles first-time conflicts and edge cases. Level 3 is rare and only for genuine ambiguity.
 
@@ -80,7 +80,7 @@ Structured operations eliminate text merge conflicts but can still conflict at a
 The resolution policy:
 
 1. **Automatic where possible**: widen semver ranges to find a compatible version, detect and flag port/name collisions
-2. **Level 2 (Claude Code)**: if automatic resolution fails, Claude proposes options based on skill intents
+2. **Level 2 (Codex)**: if automatic resolution fails, agent proposes options based on skill intents
 3. **Level 3 (User)**: if it's a genuine product choice (which Redis instance should get port 6379?), ask the user
 
 Structured operation conflicts are included in the CI overlap graph alongside code file overlaps, so the maintainer test matrix catches these before users encounter them.
@@ -148,7 +148,7 @@ Adds WhatsApp webhook route and message handler to the Express server.
 - The webhook verification flow (GET route) is required by WhatsApp Cloud API
 ```
 
-Structured headings (What, Key sections, Invariants, Must-keep) give Claude Code specific guidance during conflict resolution instead of requiring it to infer from unstructured text.
+Structured headings (What, Key sections, Invariants, Must-keep) give Codex specific guidance during conflict resolution instead of requiring it to infer from unstructured text.
 
 ### Manifest Format
 
@@ -232,9 +232,9 @@ Each layer is a separate skill with its own `SKILL.md`, manifest (with `depends:
 A user can apply a skill with their own modifications in a single step:
 
 1. Apply the skill normally (programmatic merge)
-2. Claude Code asks if the user wants to make any modifications
+2. Codex asks if the user wants to make any modifications
 3. User describes what they want different
-4. Claude Code makes the modifications on top of the freshly applied skill
+4. Codex makes the modifications on top of the freshly applied skill
 5. The modifications are recorded as a custom patch tied to this skill
 
 Recorded in `state.yaml`:
@@ -312,7 +312,7 @@ Before executing file operations:
 
 ## 6. The Apply Flow
 
-When a user runs the skill's slash command in Claude Code:
+When a user runs the skill's slash command in Codex:
 
 ### Step 1: Pre-flight Checks
 
@@ -350,8 +350,8 @@ git merge-file src/server.ts .nanoclaw/base/src/server.ts skills/add-whatsapp/mo
 
 1. **Check shared resolution cache** (`.nanoclaw/resolutions/`) — load into local `git rerere` if a verified resolution exists for this skill combination. **Only apply if input hashes match exactly** (base hash + current hash + skill modified hash).
 2. **`git rerere`** — checks local cache. If found, applied automatically. Done.
-3. **Claude Code** — reads conflict markers + `SKILL.md` + `.intent.md` (Invariants, Must-keep sections) of current and previously applied skills. Resolves. `git rerere` caches the resolution.
-4. **User** — if Claude Code cannot determine intent, it asks the user for the desired behavior.
+3. **Codex** — reads conflict markers + `SKILL.md` + `.intent.md` (Invariants, Must-keep sections) of current and previously applied skills. Resolves. `git rerere` caches the resolution.
+4. **User** — if Codex cannot determine intent, it asks the user for the desired behavior.
 
 ### Step 7: Apply Structured Operations
 
@@ -368,7 +368,7 @@ Collect all structured declarations (from this skill and any previously applied 
 1. Run any `post_apply` commands (non-structured operations only)
 2. Update `.nanoclaw/state.yaml` — skill record, file hashes (base, skill, merged per file), structured outcomes
 3. **Run skill tests** — mandatory, even if all merges were clean
-4. If tests fail on a clean merge → escalate to Level 2 (Claude Code diagnoses the semantic conflict)
+4. If tests fail on a clean merge → escalate to Level 2 (Codex diagnoses the semantic conflict)
 
 ### Step 9: Clean Up
 
@@ -382,7 +382,7 @@ If tests fail and Level 2 can't resolve, restore from `.nanoclaw/backup/` and re
 
 ### The Problem
 
-`git rerere` is local by default. But NanoClaw has thousands of users applying the same skill combinations. Every user hitting the same conflict and waiting for Claude Code to resolve it is wasteful.
+`git rerere` is local by default. But NanoClaw has thousands of users applying the same skill combinations. Every user hitting the same conflict and waiting for Codex to resolve it is wasteful.
 
 ### The Solution
 
@@ -477,7 +477,7 @@ git reset HEAD
 
 #### Implication: Git Repository Required
 
-The adapter requires `git hash-object`, `git update-index`, and `.git/rr-cache/`. This means the project directory must be a git repository for rerere caching to work. Users who download a zip (no `.git/`) lose resolution caching but not functionality — conflicts escalate directly to Level 2 (Claude Code resolves). The system should detect this case and skip rerere operations gracefully.
+The adapter requires `git hash-object`, `git update-index`, and `.git/rr-cache/`. This means the project directory must be a git repository for rerere caching to work. Users who download a zip (no `.git/`) lose resolution caching but not functionality — conflicts escalate directly to Level 2 (Codex resolves). The system should detect this case and skip rerere operations gracefully.
 
 ### Maintainer Workflow
 
@@ -579,8 +579,8 @@ The system never blocks or loses work. Option 1 generates a patch and records it
 No matter how much a user modifies their codebase outside the system, the three-level model can always bring them back:
 
 1. **Git**: diff current files against base, identify what changed
-2. **Claude Code**: read `state.yaml` to understand what skills were applied, compare against actual file state, identify discrepancies
-3. **User**: Claude Code asks what they intended, what to keep, what to discard
+2. **Codex**: read `state.yaml` to understand what skills were applied, compare against actual file state, identify discrepancies
+3. **User**: Codex asks what they intended, what to keep, what to discard
 
 There is no unrecoverable state.
 
@@ -635,7 +635,7 @@ Step 6 is just the same apply function used for any skill. The migration skill m
 - **Current**: user's file after the update merge (new core + user's customizations preserved by the earlier merge)
 - **Other**: migration skill's file (new core with Docker reverted to Apple, everything else identical)
 
-Three-way merge correctly keeps user's customizations, reverts the breaking change, and preserves all bug fixes. If there's a conflict, normal resolution: cache → Claude → user.
+Three-way merge correctly keeps user's customizations, reverts the breaking change, and preserves all bug fixes. If there's a conflict, normal resolution: cache → agent → user.
 
 For big version jumps (v0.5 → v0.8), all applicable migrations are applied in sequence. Migration skills are maintained against the latest core version, so they always compose correctly with the current codebase.
 
@@ -754,7 +754,7 @@ git merge-file src/server.ts .nanoclaw/base/src/server.ts updates/0.5.0-to-0.6.0
 
 1. Shipped resolutions (hash-verified) → automatic
 2. `git rerere` local cache → automatic
-3. Claude Code with `migration.md` + skill intents → resolves
+3. Codex with `migration.md` + skill intents → resolves
 4. User → only for genuine ambiguity
 
 #### Step 7: Re-apply Custom Patches
@@ -786,7 +786,7 @@ For each skill where the on-disk version is newer than the recorded version:
 
 Skills whose version hasn't changed are skipped — no action needed.
 
-If the user has a custom patch on a skill that changed significantly, the patch may conflict. Normal resolution: cache → Claude → user.
+If the user has a custom patch on a skill that changed significantly, the patch may conflict. Normal resolution: cache → agent → user.
 
 #### Step 11: Re-run Structured Operations
 
@@ -888,7 +888,7 @@ Given `state.yaml`, reproduce the exact installation on a fresh machine with no 
 ### Replay Flow
 
 ```bash
-# Fully programmatic — no Claude Code needed
+# Fully programmatic — no Codex needed
 
 # 1. Install core at specified version
 nanoclaw-init --version 0.5.0
@@ -999,7 +999,7 @@ project/
     channels/
       whatsapp.ts
       telegram.ts
-  skills/                           # Skill packages (Claude Code slash commands)
+  skills/                           # Skill packages (Codex slash commands)
     add-whatsapp/
       SKILL.md
       manifest.yaml
@@ -1043,7 +1043,7 @@ project/
 ## 17. Design Principles
 
 1. **Use git, don't reinvent it.** `git merge-file` for code merges, `git rerere` for caching resolutions, `git apply --3way` for custom patches.
-2. **Three-level resolution: git → Claude → user.** Programmatic first, AI second, human third.
+2. **Three-level resolution: git → agent → user.** Programmatic first, AI second, human third.
 3. **Clean merges aren't enough.** Tests run after every operation. Semantic conflicts survive text merges.
 4. **All operations are safe.** Backup before, restore on failure. No half-applied state.
 5. **One shared base.** `.nanoclaw/base/` is the clean core before any skills or customizations. It's the stable common ancestor for all three-way merges. Only updated on core updates.

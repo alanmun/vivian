@@ -32,9 +32,9 @@ No configuration sprawl. If you want different behavior, modify the code. The co
 
 ### AI-Native Development
 
-I don't need an installation wizard - Claude Code guides the setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read the logs. I don't need debugging tools - I describe the problem and Claude fixes it.
+I don't need an installation wizard - Codex guides the setup. I don't need a monitoring dashboard - I ask Codex what's happening. I don't need elaborate logging UIs - I ask agent to read the logs. I don't need debugging tools - I describe the problem and agent fixes it.
 
-The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because Claude is always there.
+The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because agent is always there.
 
 ### Skills Over Features
 
@@ -66,21 +66,21 @@ The project uses Docker by default (cross-platform). For macOS users who prefer 
 
 ## Vision
 
-A personal Claude assistant accessible via WhatsApp, with minimal custom code.
+A personal Codex assistant accessible via WhatsApp, with minimal custom code.
 
 **Core components:**
-- **Claude Agent SDK** as the core agent
+- **Codex runtime** as the core agent
 - **Containers** for isolated agent execution (Linux VMs)
 - **WhatsApp** as the primary I/O channel
 - **Persistent memory** per conversation and globally
-- **Scheduled tasks** that run Claude and can message back
+- **Scheduled tasks** that run agent and can message back
 - **Web access** for search and browsing
 - **Browser automation** via agent-browser
 
 **Implementation approach:**
-- Use existing tools (WhatsApp connector, Claude Agent SDK, MCP servers)
+- Use existing tools (WhatsApp connector, Codex runtime, MCP servers)
 - Minimal glue code
-- File-based systems where possible (CLAUDE.md for memory, folders for groups)
+- File-based systems where possible (SOUL.md for memory, folders for groups)
 
 ---
 
@@ -93,13 +93,13 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Unregistered groups are ignored completely
 
 ### Memory System
-- **Per-group memory**: Each group has a folder with its own `CLAUDE.md`
-- **Global memory**: Root `CLAUDE.md` is read by all groups, but only writable from "main" (self-chat)
+- **Base memory**: Root `SOUL.md` is read by all groups
+- **Per-group memory**: Each group can add context with its own `groups/{group}/SOUL.md`
 - **Files**: Groups can create/read files in their folder and reference them
-- Agent runs in the group's folder, automatically inherits both CLAUDE.md files
+- Agent context is either `A` (base) or `A + B` (base + group)
 
 ### Session Management
-- Each group maintains a conversation session (via Claude Agent SDK)
+- Each group maintains a conversation session (via Codex runtime)
 - Sessions auto-compact when context gets too long, preserving critical information
 
 ### Container Isolation
@@ -110,7 +110,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Browser automation via agent-browser with Chromium in the container
 
 ### Scheduled Tasks
-- Users can ask Claude to schedule recurring or one-time tasks from any group
+- Users can ask agent to schedule recurring or one-time tasks from any group
 - Tasks run as full agents in the context of the group that created them
 - Tasks have access to all tools including Bash (safe in container)
 - Tasks can optionally send messages to their group via `send_message` tool, or complete silently
@@ -127,7 +127,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ### Main Channel Privileges
 - Main channel is the admin/control group (typically self-chat)
-- Can write to global memory (`groups/CLAUDE.md`)
+- Can update base memory (`SOUL.md`) and its own group memory (`groups/main/SOUL.md`)
 - Can schedule tasks for any group
 - Can view and manage tasks from all groups
 - Can configure additional directory mounts for any group
@@ -147,11 +147,11 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Tools: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`, `send_message`
 - Tasks stored in SQLite with run history
 - Scheduler loop checks for due tasks every minute
-- Tasks execute Claude Agent SDK in containerized group context
+- Tasks execute Codex runtime in containerized group context
 
 ### Web Access
 - Built-in WebSearch and WebFetch tools
-- Standard Claude Agent SDK capabilities
+- Standard Codex runtime capabilities
 
 ### Browser Automation
 - agent-browser CLI with Chromium in container
@@ -165,8 +165,8 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ### Philosophy
 - Minimal configuration files
-- Setup and customization done via Claude Code
-- Users clone the repo and run Claude Code to configure
+- Setup and customization done via Codex
+- Users clone the repo and run Codex to configure
 - Each user gets a custom setup matching their exact needs
 
 ### Skills
@@ -186,7 +186,7 @@ These are the creator's settings, stored here for reference:
 
 - **Trigger**: `@Andy` (case insensitive)
 - **Response prefix**: `Andy:`
-- **Persona**: Default Claude (no custom personality)
+- **Persona**: Default agent (no custom personality)
 - **Main channel**: Self-chat (messaging yourself in WhatsApp)
 
 ---

@@ -80,7 +80,7 @@ If HAS_ENV=true from step 2, read `.env` and check for `CODEX_API_KEY` or `OPENA
 AskUserQuestion: Which auth should we configure?
 - `OPENAI_API_KEY` (recommended)
 - `CODEX_API_KEY` (equivalent for Codex CLI)
-- Legacy fallback (`ANTHROPIC_API_KEY`) for local shim compatibility during migration
+- Legacy fallback (`CODEX_API_KEY`) for local shim compatibility during migration
 
 Tell the user to add the selected key to `.env` (do not collect secrets in chat). For compatible non-OpenAI endpoints, also allow `OPENAI_BASE_URL`.
 

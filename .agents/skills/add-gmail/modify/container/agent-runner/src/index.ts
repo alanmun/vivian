@@ -1,593 +1,594 @@
-/**
- * NanoClaw Agent Runner
- * Runs inside a container, receives config via stdin, outputs result to stdout
- *
- * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
- *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
- *          Files: {type:"message", text:"..."}.json â€” polled and consumed
- *          Sentinel: /workspace/ipc/input/_close â€” signals session end
- *
- * Stdout protocol:
- *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
- *   Final marker after loop ends signals completion.
- */
-
-import fs from 'fs';
-import path from 'path';
-import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
-import { fileURLToPath } from 'url';
-
-interface ContainerInput {
-  prompt: string;
-  sessionId?: string;
-  groupFolder: string;
-  chatJid: string;
-  isMain: boolean;
-  isScheduledTask?: boolean;
-  assistantName?: string;
-  secrets?: Record<string, string>;
-}
-
-interface ContainerOutput {
-  status: 'success' | 'error';
-  result: string | null;
-  newSessionId?: string;
-  error?: string;
-}
-
-interface SessionEntry {
-  sessionId: string;
-  fullPath: string;
-  summary: string;
-  firstPrompt: string;
-}
-
-interface SessionsIndex {
-  entries: SessionEntry[];
-}
-
-interface SDKUserMessage {
-  type: 'user';
-  message: { role: 'user'; content: string };
-  parent_tool_use_id: null;
-  session_id: string;
-}
-
-const IPC_INPUT_DIR = '/workspace/ipc/input';
-const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 500;
-
-/**
- * Push-based async iterable for streaming user messages to the SDK.
- * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
- */
-class MessageStream {
-  private queue: SDKUserMessage[] = [];
-  private waiting: (() => void) | null = null;
-  private done = false;
-
-  push(text: string): void {
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-  }
-
-  end(): void {
-    this.done = true;
-    this.waiting?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      }
-      if (this.done) return;
-      await new Promise<void>(r => { this.waiting = r; });
-      this.waiting = null;
-    }
-  }
-}
-
-async function readStdin(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => { data += chunk; });
-    process.stdin.on('end', () => resolve(data));
-    process.stdin.on('error', reject);
-  });
-}
-
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-
-function writeOutput(output: ContainerOutput): void {
-  console.log(OUTPUT_START_MARKER);
-  console.log(JSON.stringify(output));
-  console.log(OUTPUT_END_MARKER);
-}
-
-function log(message: string): void {
-  console.error(`[agent-runner] ${message}`);
-}
-
-function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, 'sessions-index.json');
-
-  if (!fs.existsSync(indexPath)) {
-    log(`Sessions index not found at ${indexPath}`);
-    return null;
-  }
-
-  try {
-    const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const entry = index.entries.find(e => e.sessionId === sessionId);
-    if (entry?.summary) {
-      return entry.summary;
-    }
-  } catch (err) {
-    log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return null;
-}
-
-/**
- * Archive the full transcript to conversations/ before compaction.
- */
-function createPreCompactHook(assistantName?: string): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preCompact = input as PreCompactHookInput;
-    const transcriptPath = preCompact.transcript_path;
-    const sessionId = preCompact.session_id;
-
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log('No transcript found for archiving');
-      return {};
-    }
-
-    try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
-
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
-      }
-
-      const summary = getSessionSummary(sessionId, transcriptPath);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
-    } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    return {};
-  };
-}
-
-// Secrets to strip from Bash tool subprocess environments.
-// These are needed by claude-code for API auth but should never
-// be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
-
-function createSanitizeBashHook(): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preInput = input as PreToolUseHookInput;
-    const command = (preInput.tool_input as { command?: string })?.command;
-    if (!command) return {};
-
-    const unsetPrefix = `unset ${SECRET_ENV_VARS.join(' ')} 2>/dev/null; `;
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        updatedInput: {
-          ...(preInput.tool_input as Record<string, unknown>),
-          command: unsetPrefix + command,
-        },
-      },
-    };
-  };
-}
-
-function sanitizeFilename(summary: string): string {
-  return summary
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 50);
-}
-
-function generateFallbackName(): string {
-  const time = new Date();
-  return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
-}
-
-interface ParsedMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
-    }
-  }
-
-  return messages;
-}
-
-function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null, assistantName?: string): string {
-  const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
-
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : (assistantName || 'Assistant');
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
-/**
- * Check for _close sentinel.
- */
-function shouldClose(): boolean {
-  if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
-    return true;
-  }
-  return false;
-}
-
-/**
- * Drain all pending IPC input messages.
- * Returns messages found, or empty array.
- */
-function drainIpcInput(): string[] {
-  try {
-    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json'))
-      .sort();
-
-    const messages: string[] = [];
-    for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
-      try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          messages.push(data.text);
-        }
-      } catch (err) {
-        log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-      }
-    }
-    return messages;
-  } catch (err) {
-    log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
-  }
-}
-
-/**
- * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
- */
-function waitForIpcMessage(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const poll = () => {
-      if (shouldClose()) {
-        resolve(null);
-        return;
-      }
-      const messages = drainIpcInput();
-      if (messages.length > 0) {
-        resolve(messages.join('\n'));
-        return;
-      }
-      setTimeout(poll, IPC_POLL_MS);
-    };
-    poll();
-  });
-}
-
-/**
- * Run a single query and stream results via writeOutput.
- * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
- * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
- */
-async function runQuery(
-  prompt: string,
-  sessionId: string | undefined,
-  mcpServerPath: string,
-  containerInput: ContainerInput,
-  sdkEnv: Record<string, string | undefined>,
-  resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const stream = new MessageStream();
-  stream.push(prompt);
-
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
-  let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let messageCount = 0;
-  let resultCount = 0;
-
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
-  }
-
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
-  const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
-      }
-    }
-  }
-  if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
-  }
-
-  for await (const message of query({
-    prompt: stream,
-    options: {
-      cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*',
-        'mcp__gmail__*',
-      ],
-      env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-        gmail: {
-          command: 'npx',
-          args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
-        },
-      },
-      hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
-      },
-    }
-  })) {
-    messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
-
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-    }
-
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-    }
-
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
-    }
-
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
-      });
-    }
-  }
-
-  ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
-}
-
-async function main(): Promise<void> {
-  let containerInput: ContainerInput;
-
-  try {
-    const stdinData = await readStdin();
-    containerInput = JSON.parse(stdinData);
-    // Delete the temp file the entrypoint wrote â€” it contains secrets
-    try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
-  } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
-    process.exit(1);
-  }
-
-  // Build SDK env: merge secrets into process.env for the SDK only.
-  // Secrets never touch process.env itself, so Bash subprocesses can't see them.
-  const sdkEnv: Record<string, string | undefined> = { ...process.env };
-  for (const [key, value] of Object.entries(containerInput.secrets || {})) {
-    sdkEnv[key] = value;
-  }
-
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
-
-  let sessionId = containerInput.sessionId;
-  fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-
-  // Clean up stale _close sentinel from previous container runs
-  try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
-
-  // Build initial prompt (drain any pending IPC messages too)
-  let prompt = containerInput.prompt;
-  if (containerInput.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
-  }
-  const pending = drainIpcInput();
-  if (pending.length > 0) {
-    log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
-  }
-
-  // Query loop: run query â†’ wait for IPC message â†’ run new query â†’ repeat
-  let resumeAt: string | undefined;
-  try {
-    while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
-
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
-      }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
-      }
-
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
-
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
-
-      log('Query ended, waiting for next IPC message...');
-
-      // Wait for the next message or _close sentinel
-      const nextMessage = await waitForIpcMessage();
-      if (nextMessage === null) {
-        log('Close sentinel received, exiting');
-        break;
-      }
-
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
-    }
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    log(`Agent error: ${errorMessage}`);
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId: sessionId,
-      error: errorMessage
-    });
-    process.exit(1);
-  }
-}
-
-main();
+codex/codex*codex*codex
+codex codex*codex codexNcodexacodexncodexocodexCcodexlcodexacodexwcodex codexAcodexgcodexecodexncodextcodex codexRcodexucodexncodexncodexecodexrcodex
+codex codex*codex codexRcodexucodexncodexscodex codexicodexncodexscodexicodexdcodexecodex codexacodex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodex,codex codexrcodexecodexccodexecodexicodexvcodexecodexscodex codexccodexocodexncodexfcodexicodexgcodex codexvcodexicodexacodex codexscodextcodexdcodexicodexncodex,codex codexocodexucodextcodexpcodexucodextcodexscodex codexrcodexecodexscodexucodexlcodextcodex codextcodexocodex codexscodextcodexdcodexocodexucodextcodex
+codex codex*codex
+codex codex*codex codexIcodexncodexpcodexucodextcodex codexpcodexrcodexocodextcodexocodexccodexocodexlcodex:codex
+codex codex*codex codex codex codexScodextcodexdcodexicodexncodex:codex codexFcodexucodexlcodexlcodex codexCcodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex codexJcodexScodexOcodexNcodex codex(codexrcodexecodexacodexdcodex codexucodexncodextcodexicodexlcodex codexEcodexOcodexFcodex,codex codexlcodexicodexkcodexecodex codexbcodexecodexfcodexocodexrcodexecodex)codex
+codex codex*codex codex codex codexIcodexPcodexCcodex:codex codex codex codexFcodexocodexlcodexlcodexocodexwcodex-codexucodexpcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codexwcodexrcodexicodextcodextcodexecodexncodex codexacodexscodex codexJcodexScodexOcodexNcodex codexfcodexicodexlcodexecodexscodex codextcodexocodex codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexicodexpcodexccodex/codexicodexncodexpcodexucodextcodex/codex
+codex codex*codex codex codex codex codex codex codex codex codex codex codexFcodexicodexlcodexecodexscodex:codex codex{codextcodexycodexpcodexecodex:codex"codexmcodexecodexscodexscodexacodexgcodexecodex"codex,codex codextcodexecodexxcodextcodex:codex"codex.codex.codex.codex"codex}codex.codexjcodexscodexocodexncodex codexâcodex€codex”codex codexpcodexocodexlcodexlcodexecodexdcodex codexacodexncodexdcodex codexccodexocodexncodexscodexucodexmcodexecodexdcodex
+codex codex*codex codex codex codex codex codex codex codex codex codex codexScodexecodexncodextcodexicodexncodexecodexlcodex:codex codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexicodexpcodexccodex/codexicodexncodexpcodexucodextcodex/codex_codexccodexlcodexocodexscodexecodex codexâcodex€codex”codex codexscodexicodexgcodexncodexacodexlcodexscodex codexscodexecodexscodexscodexicodexocodexncodex codexecodexncodexdcodex
+codex codex*codex
+codex codex*codex codexScodextcodexdcodexocodexucodextcodex codexpcodexrcodexocodextcodexocodexccodexocodexlcodex:codex
+codex codex*codex codex codex codexEcodexacodexccodexhcodex codexrcodexecodexscodexucodexlcodextcodex codexicodexscodex codexwcodexrcodexacodexpcodexpcodexecodexdcodex codexicodexncodex codexOcodexUcodexTcodexPcodexUcodexTcodex_codexScodexTcodexAcodexRcodexTcodex_codexMcodexAcodexRcodexKcodexEcodexRcodex codex/codex codexOcodexUcodexTcodexPcodexUcodexTcodex_codexEcodexNcodexDcodex_codexMcodexAcodexRcodexKcodexEcodexRcodex codexpcodexacodexicodexrcodexscodex.codex
+codex codex*codex codex codex codexMcodexucodexlcodextcodexicodexpcodexlcodexecodex codexrcodexecodexscodexucodexlcodextcodexscodex codexmcodexacodexycodex codexbcodexecodex codexecodexmcodexicodextcodextcodexecodexdcodex codex(codexocodexncodexecodex codexpcodexecodexrcodex codexacodexgcodexecodexncodextcodex codextcodexecodexacodexmcodexscodex codexrcodexecodexscodexucodexlcodextcodex)codex.codex
+codex codex*codex codex codex codexFcodexicodexncodexacodexlcodex codexmcodexacodexrcodexkcodexecodexrcodex codexacodexfcodextcodexecodexrcodex codexlcodexocodexocodexpcodex codexecodexncodexdcodexscodex codexscodexicodexgcodexncodexacodexlcodexscodex codexccodexocodexmcodexpcodexlcodexecodextcodexicodexocodexncodex.codex
+codex codex*codex/codex
+codex
+codexicodexmcodexpcodexocodexrcodextcodex codexfcodexscodex codexfcodexrcodexocodexmcodex codex'codexfcodexscodex'codex;codex
+codexicodexmcodexpcodexocodexrcodextcodex codexpcodexacodextcodexhcodex codexfcodexrcodexocodexmcodex codex'codexpcodexacodextcodexhcodex'codex;codex
+codexicodexmcodexpcodexocodexrcodextcodex codex{codex codexqcodexucodexecodexrcodexycodex,codex codexHcodexocodexocodexkcodexCcodexacodexlcodexlcodexbcodexacodexccodexkcodex,codex codexPcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodexHcodexocodexocodexkcodexIcodexncodexpcodexucodextcodex,codex codexPcodexrcodexecodexTcodexocodexocodexlcodexUcodexscodexecodexHcodexocodexocodexkcodexIcodexncodexpcodexucodextcodex codex}codex codexfcodexrcodexocodexmcodex codex'codex@codexacodexncodextcodexhcodexrcodexocodexpcodexicodexccodexccodexocodexdcodexecodexxcodex'codex;codex
+codexicodexmcodexpcodexocodexrcodextcodex codex{codex codexfcodexicodexlcodexecodexUcodexRcodexLcodexTcodexocodexPcodexacodextcodexhcodex codex}codex codexfcodexrcodexocodexmcodex codex'codexucodexrcodexlcodex'codex;codex
+codex
+codexicodexncodextcodexecodexrcodexfcodexacodexccodexecodex codexCcodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex codex{codex
+codex codex codexpcodexrcodexocodexmcodexpcodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexgcodexrcodexocodexucodexpcodexFcodexocodexlcodexdcodexecodexrcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexccodexhcodexacodextcodexJcodexicodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexicodexscodexMcodexacodexicodexncodex:codex codexbcodexocodexocodexlcodexecodexacodexncodex;codex
+codex codex codexicodexscodexScodexccodexhcodexecodexdcodexucodexlcodexecodexdcodexTcodexacodexscodexkcodex?codex:codex codexbcodexocodexocodexlcodexecodexacodexncodex;codex
+codex codex codexacodexscodexscodexicodexscodextcodexacodexncodextcodexNcodexacodexmcodexecodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexscodexecodexccodexrcodexecodextcodexscodex?codex:codex codexRcodexecodexccodexocodexrcodexdcodex<codexscodextcodexrcodexicodexncodexgcodex,codex codexscodextcodexrcodexicodexncodexgcodex>codex;codex
+codex}codex
+codex
+codexicodexncodextcodexecodexrcodexfcodexacodexccodexecodex codexCcodexocodexncodextcodexacodexicodexncodexecodexrcodexOcodexucodextcodexpcodexucodextcodex codex{codex
+codex codex codexscodextcodexacodextcodexucodexscodex:codex codex'codexscodexucodexccodexccodexecodexscodexscodex'codex codex|codex codex'codexecodexrcodexrcodexocodexrcodex'codex;codex
+codex codex codexrcodexecodexscodexucodexlcodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexncodexucodexlcodexlcodex;codex
+codex codex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexecodexrcodexrcodexocodexrcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex}codex
+codex
+codexicodexncodextcodexecodexrcodexfcodexacodexccodexecodex codexScodexecodexscodexscodexicodexocodexncodexEcodexncodextcodexrcodexycodex codex{codex
+codex codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexfcodexucodexlcodexlcodexPcodexacodextcodexhcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexscodexucodexmcodexmcodexacodexrcodexycodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex codex codexfcodexicodexrcodexscodextcodexPcodexrcodexocodexmcodexpcodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex}codex
+codex
+codexicodexncodextcodexecodexrcodexfcodexacodexccodexecodex codexScodexecodexscodexscodexicodexocodexncodexscodexIcodexncodexdcodexecodexxcodex codex{codex
+codex codex codexecodexncodextcodexrcodexicodexecodexscodex:codex codexScodexecodexscodexscodexicodexocodexncodexEcodexncodextcodexrcodexycodex[codex]codex;codex
+codex}codex
+codex
+codexicodexncodextcodexecodexrcodexfcodexacodexccodexecodex codexScodexDcodexKcodexUcodexscodexecodexrcodexMcodexecodexscodexscodexacodexgcodexecodex codex{codex
+codex codex codextcodexycodexpcodexecodex:codex codex'codexucodexscodexecodexrcodex'codex;codex
+codex codex codexmcodexecodexscodexscodexacodexgcodexecodex:codex codex{codex codexrcodexocodexlcodexecodex:codex codex'codexucodexscodexecodexrcodex'codex;codex codexccodexocodexncodextcodexecodexncodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex;codex
+codex codex codexpcodexacodexrcodexecodexncodextcodex_codextcodexocodexocodexlcodex_codexucodexscodexecodex_codexicodexdcodex:codex codexncodexucodexlcodexlcodex;codex
+codex codex codexscodexecodexscodexscodexicodexocodexncodex_codexicodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex}codex
+codex
+codexccodexocodexncodexscodextcodex codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexDcodexIcodexRcodex codex=codex codex'codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexicodexpcodexccodex/codexicodexncodexpcodexucodextcodex'codex;codex
+codexccodexocodexncodexscodextcodex codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexCcodexLcodexOcodexScodexEcodex_codexScodexEcodexNcodexTcodexIcodexNcodexEcodexLcodex codex=codex codexpcodexacodextcodexhcodex.codexjcodexocodexicodexncodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexDcodexIcodexRcodex,codex codex'codex_codexccodexlcodexocodexscodexecodex'codex)codex;codex
+codexccodexocodexncodexscodextcodex codexIcodexPcodexCcodex_codexPcodexOcodexLcodexLcodex_codexMcodexScodex codex=codex codex5codex0codex0codex;codex
+codex
+codex/codex*codex*codex
+codex codex*codex codexPcodexucodexscodexhcodex-codexbcodexacodexscodexecodexdcodex codexacodexscodexycodexncodexccodex codexicodextcodexecodexrcodexacodexbcodexlcodexecodex codexfcodexocodexrcodex codexscodextcodexrcodexecodexacodexmcodexicodexncodexgcodex codexucodexscodexecodexrcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codextcodexocodex codextcodexhcodexecodex codexScodexDcodexKcodex.codex
+codex codex*codex codexKcodexecodexecodexpcodexscodex codextcodexhcodexecodex codexicodextcodexecodexrcodexacodexbcodexlcodexecodex codexacodexlcodexicodexvcodexecodex codexucodexncodextcodexicodexlcodex codexecodexncodexdcodex(codex)codex codexicodexscodex codexccodexacodexlcodexlcodexecodexdcodex,codex codexpcodexrcodexecodexvcodexecodexncodextcodexicodexncodexgcodex codexicodexscodexScodexicodexncodexgcodexlcodexecodexUcodexscodexecodexrcodexTcodexucodexrcodexncodex.codex
+codex codex*codex/codex
+codexccodexlcodexacodexscodexscodex codexMcodexecodexscodexscodexacodexgcodexecodexScodextcodexrcodexecodexacodexmcodex codex{codex
+codex codex codexpcodexrcodexicodexvcodexacodextcodexecodex codexqcodexucodexecodexucodexecodex:codex codexScodexDcodexKcodexUcodexscodexecodexrcodexMcodexecodexscodexscodexacodexgcodexecodex[codex]codex codex=codex codex[codex]codex;codex
+codex codex codexpcodexrcodexicodexvcodexacodextcodexecodex codexwcodexacodexicodextcodexicodexncodexgcodex:codex codex(codex(codex)codex codex=codex>codex codexvcodexocodexicodexdcodex)codex codex|codex codexncodexucodexlcodexlcodex codex=codex codexncodexucodexlcodexlcodex;codex
+codex codex codexpcodexrcodexicodexvcodexacodextcodexecodex codexdcodexocodexncodexecodex codex=codex codexfcodexacodexlcodexscodexecodex;codex
+codex
+codex codex codexpcodexucodexscodexhcodex(codextcodexecodexxcodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex)codex:codex codexvcodexocodexicodexdcodex codex{codex
+codex codex codex codex codextcodexhcodexicodexscodex.codexqcodexucodexecodexucodexecodex.codexpcodexucodexscodexhcodex(codex{codex
+codex codex codex codex codex codex codextcodexycodexpcodexecodex:codex codex'codexucodexscodexecodexrcodex'codex,codex
+codex codex codex codex codex codex codexmcodexecodexscodexscodexacodexgcodexecodex:codex codex{codex codexrcodexocodexlcodexecodex:codex codex'codexucodexscodexecodexrcodex'codex,codex codexccodexocodexncodextcodexecodexncodextcodex:codex codextcodexecodexxcodextcodex codex}codex,codex
+codex codex codex codex codex codex codexpcodexacodexrcodexecodexncodextcodex_codextcodexocodexocodexlcodex_codexucodexscodexecodex_codexicodexdcodex:codex codexncodexucodexlcodexlcodex,codex
+codex codex codex codex codex codex codexscodexecodexscodexscodexicodexocodexncodex_codexicodexdcodex:codex codex'codex'codex,codex
+codex codex codex codex codex}codex)codex;codex
+codex codex codex codex codextcodexhcodexicodexscodex.codexwcodexacodexicodextcodexicodexncodexgcodex?codex.codex(codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codexecodexncodexdcodex(codex)codex:codex codexvcodexocodexicodexdcodex codex{codex
+codex codex codex codex codextcodexhcodexicodexscodex.codexdcodexocodexncodexecodex codex=codex codextcodexrcodexucodexecodex;codex
+codex codex codex codex codextcodexhcodexicodexscodex.codexwcodexacodexicodextcodexicodexncodexgcodex?codex.codex(codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codexacodexscodexycodexncodexccodex codex*codex[codexScodexycodexmcodexbcodexocodexlcodex.codexacodexscodexycodexncodexccodexIcodextcodexecodexrcodexacodextcodexocodexrcodex]codex(codex)codex:codex codexAcodexscodexycodexncodexccodexGcodexecodexncodexecodexrcodexacodextcodexocodexrcodex<codexScodexDcodexKcodexUcodexscodexecodexrcodexMcodexecodexscodexscodexacodexgcodexecodex>codex codex{codex
+codex codex codex codex codexwcodexhcodexicodexlcodexecodex codex(codextcodexrcodexucodexecodex)codex codex{codex
+codex codex codex codex codex codex codexwcodexhcodexicodexlcodexecodex codex(codextcodexhcodexicodexscodex.codexqcodexucodexecodexucodexecodex.codexlcodexecodexncodexgcodextcodexhcodex codex>codex codex0codex)codex codex{codex
+codex codex codex codex codex codex codex codex codexycodexicodexecodexlcodexdcodex codextcodexhcodexicodexscodex.codexqcodexucodexecodexucodexecodex.codexscodexhcodexicodexfcodextcodex(codex)codex!codex;codex
+codex codex codex codex codex codex codex}codex
+codex codex codex codex codex codex codexicodexfcodex codex(codextcodexhcodexicodexscodex.codexdcodexocodexncodexecodex)codex codexrcodexecodextcodexucodexrcodexncodex;codex
+codex codex codex codex codex codex codexacodexwcodexacodexicodextcodex codexncodexecodexwcodex codexPcodexrcodexocodexmcodexicodexscodexecodex<codexvcodexocodexicodexdcodex>codex(codexrcodex codex=codex>codex codex{codex codextcodexhcodexicodexscodex.codexwcodexacodexicodextcodexicodexncodexgcodex codex=codex codexrcodex;codex codex}codex)codex;codex
+codex codex codex codex codex codex codextcodexhcodexicodexscodex.codexwcodexacodexicodextcodexicodexncodexgcodex codex=codex codexncodexucodexlcodexlcodex;codex
+codex codex codex codex codex}codex
+codex codex codex}codex
+codex}codex
+codex
+codexacodexscodexycodexncodexccodex codexfcodexucodexncodexccodextcodexicodexocodexncodex codexrcodexecodexacodexdcodexScodextcodexdcodexicodexncodex(codex)codex:codex codexPcodexrcodexocodexmcodexicodexscodexecodex<codexscodextcodexrcodexicodexncodexgcodex>codex codex{codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexncodexecodexwcodex codexPcodexrcodexocodexmcodexicodexscodexecodex(codex(codexrcodexecodexscodexocodexlcodexvcodexecodex,codex codexrcodexecodexjcodexecodexccodextcodex)codex codex=codex>codex codex{codex
+codex codex codex codex codexlcodexecodextcodex codexdcodexacodextcodexacodex codex=codex codex'codex'codex;codex
+codex codex codex codex codexpcodexrcodexocodexccodexecodexscodexscodex.codexscodextcodexdcodexicodexncodex.codexscodexecodextcodexEcodexncodexccodexocodexdcodexicodexncodexgcodex(codex'codexucodextcodexfcodex8codex'codex)codex;codex
+codex codex codex codex codexpcodexrcodexocodexccodexecodexscodexscodex.codexscodextcodexdcodexicodexncodex.codexocodexncodex(codex'codexdcodexacodextcodexacodex'codex,codex codexccodexhcodexucodexncodexkcodex codex=codex>codex codex{codex codexdcodexacodextcodexacodex codex+codex=codex codexccodexhcodexucodexncodexkcodex;codex codex}codex)codex;codex
+codex codex codex codex codexpcodexrcodexocodexccodexecodexscodexscodex.codexscodextcodexdcodexicodexncodex.codexocodexncodex(codex'codexecodexncodexdcodex'codex,codex codex(codex)codex codex=codex>codex codexrcodexecodexscodexocodexlcodexvcodexecodex(codexdcodexacodextcodexacodex)codex)codex;codex
+codex codex codex codex codexpcodexrcodexocodexccodexecodexscodexscodex.codexscodextcodexdcodexicodexncodex.codexocodexncodex(codex'codexecodexrcodexrcodexocodexrcodex'codex,codex codexrcodexecodexjcodexecodexccodextcodex)codex;codex
+codex codex codex}codex)codex;codex
+codex}codex
+codex
+codexccodexocodexncodexscodextcodex codexOcodexUcodexTcodexPcodexUcodexTcodex_codexScodexTcodexAcodexRcodexTcodex_codexMcodexAcodexRcodexKcodexEcodexRcodex codex=codex codex'codex-codex-codex-codexNcodexAcodexNcodexOcodexCcodexLcodexAcodexWcodex_codexOcodexUcodexTcodexPcodexUcodexTcodex_codexScodexTcodexAcodexRcodexTcodex-codex-codex-codex'codex;codex
+codexccodexocodexncodexscodextcodex codexOcodexUcodexTcodexPcodexUcodexTcodex_codexEcodexNcodexDcodex_codexMcodexAcodexRcodexKcodexEcodexRcodex codex=codex codex'codex-codex-codex-codexNcodexAcodexNcodexOcodexCcodexLcodexAcodexWcodex_codexOcodexUcodexTcodexPcodexUcodexTcodex_codexEcodexNcodexDcodex-codex-codex-codex'codex;codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexwcodexrcodexicodextcodexecodexOcodexucodextcodexpcodexucodextcodex(codexocodexucodextcodexpcodexucodextcodex:codex codexCcodexocodexncodextcodexacodexicodexncodexecodexrcodexOcodexucodextcodexpcodexucodextcodex)codex:codex codexvcodexocodexicodexdcodex codex{codex
+codex codex codexccodexocodexncodexscodexocodexlcodexecodex.codexlcodexocodexgcodex(codexOcodexUcodexTcodexPcodexUcodexTcodex_codexScodexTcodexAcodexRcodexTcodex_codexMcodexAcodexRcodexKcodexEcodexRcodex)codex;codex
+codex codex codexccodexocodexncodexscodexocodexlcodexecodex.codexlcodexocodexgcodex(codexJcodexScodexOcodexNcodex.codexscodextcodexrcodexicodexncodexgcodexicodexfcodexycodex(codexocodexucodextcodexpcodexucodextcodex)codex)codex;codex
+codex codex codexccodexocodexncodexscodexocodexlcodexecodex.codexlcodexocodexgcodex(codexOcodexUcodexTcodexPcodexUcodexTcodex_codexEcodexNcodexDcodex_codexMcodexAcodexRcodexKcodexEcodexRcodex)codex;codex
+codex}codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexlcodexocodexgcodex(codexmcodexecodexscodexscodexacodexgcodexecodex:codex codexscodextcodexrcodexicodexncodexgcodex)codex:codex codexvcodexocodexicodexdcodex codex{codex
+codex codex codexccodexocodexncodexscodexocodexlcodexecodex.codexecodexrcodexrcodexocodexrcodex(codex`codex[codexacodexgcodexecodexncodextcodex-codexrcodexucodexncodexncodexecodexrcodex]codex codex$codex{codexmcodexecodexscodexscodexacodexgcodexecodex}codex`codex)codex;codex
+codex}codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexgcodexecodextcodexScodexecodexscodexscodexicodexocodexncodexScodexucodexmcodexmcodexacodexrcodexycodex(codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex,codex codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexPcodexacodextcodexhcodex:codex codexscodextcodexrcodexicodexncodexgcodex)codex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexncodexucodexlcodexlcodex codex{codex
+codex codex codexccodexocodexncodexscodextcodex codexpcodexrcodexocodexjcodexecodexccodextcodexDcodexicodexrcodex codex=codex codexpcodexacodextcodexhcodex.codexdcodexicodexrcodexncodexacodexmcodexecodex(codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexPcodexacodextcodexhcodex)codex;codex
+codex codex codexccodexocodexncodexscodextcodex codexicodexncodexdcodexecodexxcodexPcodexacodextcodexhcodex codex=codex codexpcodexacodextcodexhcodex.codexjcodexocodexicodexncodex(codexpcodexrcodexocodexjcodexecodexccodextcodexDcodexicodexrcodex,codex codex'codexscodexecodexscodexscodexicodexocodexncodexscodex-codexicodexncodexdcodexecodexxcodex.codexjcodexscodexocodexncodex'codex)codex;codex
+codex
+codex codex codexicodexfcodex codex(codex!codexfcodexscodex.codexecodexxcodexicodexscodextcodexscodexScodexycodexncodexccodex(codexicodexncodexdcodexecodexxcodexPcodexacodextcodexhcodex)codex)codex codex{codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codexScodexecodexscodexscodexicodexocodexncodexscodex codexicodexncodexdcodexecodexxcodex codexncodexocodextcodex codexfcodexocodexucodexncodexdcodex codexacodextcodex codex$codex{codexicodexncodexdcodexecodexxcodexPcodexacodextcodexhcodex}codex`codex)codex;codex
+codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codexncodexucodexlcodexlcodex;codex
+codex codex codex}codex
+codex
+codex codex codextcodexrcodexycodex codex{codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexicodexncodexdcodexecodexxcodex:codex codexScodexecodexscodexscodexicodexocodexncodexscodexIcodexncodexdcodexecodexxcodex codex=codex codexJcodexScodexOcodexNcodex.codexpcodexacodexrcodexscodexecodex(codexfcodexscodex.codexrcodexecodexacodexdcodexFcodexicodexlcodexecodexScodexycodexncodexccodex(codexicodexncodexdcodexecodexxcodexPcodexacodextcodexhcodex,codex codex'codexucodextcodexfcodex-codex8codex'codex)codex)codex;codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexecodexncodextcodexrcodexycodex codex=codex codexicodexncodexdcodexecodexxcodex.codexecodexncodextcodexrcodexicodexecodexscodex.codexfcodexicodexncodexdcodex(codexecodex codex=codex>codex codexecodex.codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex codex=codex=codex=codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex)codex;codex
+codex codex codex codex codexicodexfcodex codex(codexecodexncodextcodexrcodexycodex?codex.codexscodexucodexmcodexmcodexacodexrcodexycodex)codex codex{codex
+codex codex codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codexecodexncodextcodexrcodexycodex.codexscodexucodexmcodexmcodexacodexrcodexycodex;codex
+codex codex codex codex codex}codex
+codex codex codex}codex codexccodexacodextcodexccodexhcodex codex(codexecodexrcodexrcodex)codex codex{codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codexFcodexacodexicodexlcodexecodexdcodex codextcodexocodex codexrcodexecodexacodexdcodex codexscodexecodexscodexscodexicodexocodexncodexscodex codexicodexncodexdcodexecodexxcodex:codex codex$codex{codexecodexrcodexrcodex codexicodexncodexscodextcodexacodexncodexccodexecodexocodexfcodex codexEcodexrcodexrcodexocodexrcodex codex?codex codexecodexrcodexrcodex.codexmcodexecodexscodexscodexacodexgcodexecodex codex:codex codexScodextcodexrcodexicodexncodexgcodex(codexecodexrcodexrcodex)codex}codex`codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexncodexucodexlcodexlcodex;codex
+codex}codex
+codex
+codex/codex*codex*codex
+codex codex*codex codexAcodexrcodexccodexhcodexicodexvcodexecodex codextcodexhcodexecodex codexfcodexucodexlcodexlcodex codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodex codextcodexocodex codexccodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodexscodex/codex codexbcodexecodexfcodexocodexrcodexecodex codexccodexocodexmcodexpcodexacodexccodextcodexicodexocodexncodex.codex
+codex codex*codex/codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexccodexrcodexecodexacodextcodexecodexPcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodexHcodexocodexocodexkcodex(codexacodexscodexscodexicodexscodextcodexacodexncodextcodexNcodexacodexmcodexecodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex)codex:codex codexHcodexocodexocodexkcodexCcodexacodexlcodexlcodexbcodexacodexccodexkcodex codex{codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexacodexscodexycodexncodexccodex codex(codexicodexncodexpcodexucodextcodex,codex codex_codextcodexocodexocodexlcodexUcodexscodexecodexIcodexdcodex,codex codex_codexccodexocodexncodextcodexecodexxcodextcodex)codex codex=codex>codex codex{codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexpcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodex codex=codex codexicodexncodexpcodexucodextcodex codexacodexscodex codexPcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodexHcodexocodexocodexkcodexIcodexncodexpcodexucodextcodex;codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexPcodexacodextcodexhcodex codex=codex codexpcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodex.codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodex_codexpcodexacodextcodexhcodex;codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex codex=codex codexpcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodex.codexscodexecodexscodexscodexicodexocodexncodex_codexicodexdcodex;codex
+codex
+codex codex codex codex codexicodexfcodex codex(codex!codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexPcodexacodextcodexhcodex codex|codex|codex codex!codexfcodexscodex.codexecodexxcodexicodexscodextcodexscodexScodexycodexncodexccodex(codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexPcodexacodextcodexhcodex)codex)codex codex{codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex'codexNcodexocodex codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodex codexfcodexocodexucodexncodexdcodex codexfcodexocodexrcodex codexacodexrcodexccodexhcodexicodexvcodexicodexncodexgcodex'codex)codex;codex
+codex codex codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codex{codex}codex;codex
+codex codex codex codex codex}codex
+codex
+codex codex codex codex codextcodexrcodexycodex codex{codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexccodexocodexncodextcodexecodexncodextcodex codex=codex codexfcodexscodex.codexrcodexecodexacodexdcodexFcodexicodexlcodexecodexScodexycodexncodexccodex(codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexPcodexacodextcodexhcodex,codex codex'codexucodextcodexfcodex-codex8codex'codex)codex;codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codex=codex codexpcodexacodexrcodexscodexecodexTcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodex(codexccodexocodexncodextcodexecodexncodextcodex)codex;codex
+codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexmcodexecodexscodexscodexacodexgcodexecodexscodex.codexlcodexecodexncodexgcodextcodexhcodex codex=codex=codex=codex codex0codex)codex codex{codex
+codex codex codex codex codex codex codex codex codexlcodexocodexgcodex(codex'codexNcodexocodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codextcodexocodex codexacodexrcodexccodexhcodexicodexvcodexecodex'codex)codex;codex
+codex codex codex codex codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codex{codex}codex;codex
+codex codex codex codex codex codex codex}codex
+codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexscodexucodexmcodexmcodexacodexrcodexycodex codex=codex codexgcodexecodextcodexScodexecodexscodexscodexicodexocodexncodexScodexucodexmcodexmcodexacodexrcodexycodex(codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex,codex codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexPcodexacodextcodexhcodex)codex;codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexncodexacodexmcodexecodex codex=codex codexscodexucodexmcodexmcodexacodexrcodexycodex codex?codex codexscodexacodexncodexicodextcodexicodexzcodexecodexFcodexicodexlcodexecodexncodexacodexmcodexecodex(codexscodexucodexmcodexmcodexacodexrcodexycodex)codex codex:codex codexgcodexecodexncodexecodexrcodexacodextcodexecodexFcodexacodexlcodexlcodexbcodexacodexccodexkcodexNcodexacodexmcodexecodex(codex)codex;codex
+codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexccodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodexscodexDcodexicodexrcodex codex=codex codex'codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexgcodexrcodexocodexucodexpcodex/codexccodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodexscodex'codex;codex
+codex codex codex codex codex codex codexfcodexscodex.codexmcodexkcodexdcodexicodexrcodexScodexycodexncodexccodex(codexccodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodexscodexDcodexicodexrcodex,codex codex{codex codexrcodexecodexccodexucodexrcodexscodexicodexvcodexecodex:codex codextcodexrcodexucodexecodex codex}codex)codex;codex
+codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexdcodexacodextcodexecodex codex=codex codexncodexecodexwcodex codexDcodexacodextcodexecodex(codex)codex.codextcodexocodexIcodexScodexOcodexScodextcodexrcodexicodexncodexgcodex(codex)codex.codexscodexpcodexlcodexicodextcodex(codex'codexTcodex'codex)codex[codex0codex]codex;codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexfcodexicodexlcodexecodexncodexacodexmcodexecodex codex=codex codex`codex$codex{codexdcodexacodextcodexecodex}codex-codex$codex{codexncodexacodexmcodexecodex}codex.codexmcodexdcodex`codex;codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexfcodexicodexlcodexecodexPcodexacodextcodexhcodex codex=codex codexpcodexacodextcodexhcodex.codexjcodexocodexicodexncodex(codexccodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodexscodexDcodexicodexrcodex,codex codexfcodexicodexlcodexecodexncodexacodexmcodexecodex)codex;codex
+codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexmcodexacodexrcodexkcodexdcodexocodexwcodexncodex codex=codex codexfcodexocodexrcodexmcodexacodextcodexTcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexMcodexacodexrcodexkcodexdcodexocodexwcodexncodex(codexmcodexecodexscodexscodexacodexgcodexecodexscodex,codex codexscodexucodexmcodexmcodexacodexrcodexycodex,codex codexacodexscodexscodexicodexscodextcodexacodexncodextcodexNcodexacodexmcodexecodex)codex;codex
+codex codex codex codex codex codex codexfcodexscodex.codexwcodexrcodexicodextcodexecodexFcodexicodexlcodexecodexScodexycodexncodexccodex(codexfcodexicodexlcodexecodexPcodexacodextcodexhcodex,codex codexmcodexacodexrcodexkcodexdcodexocodexwcodexncodex)codex;codex
+codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexAcodexrcodexccodexhcodexicodexvcodexecodexdcodex codexccodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodex codextcodexocodex codex$codex{codexfcodexicodexlcodexecodexPcodexacodextcodexhcodex}codex`codex)codex;codex
+codex codex codex codex codex}codex codexccodexacodextcodexccodexhcodex codex(codexecodexrcodexrcodex)codex codex{codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexFcodexacodexicodexlcodexecodexdcodex codextcodexocodex codexacodexrcodexccodexhcodexicodexvcodexecodex codextcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodex:codex codex$codex{codexecodexrcodexrcodex codexicodexncodexscodextcodexacodexncodexccodexecodexocodexfcodex codexEcodexrcodexrcodexocodexrcodex codex?codex codexecodexrcodexrcodex.codexmcodexecodexscodexscodexacodexgcodexecodex codex:codex codexScodextcodexrcodexicodexncodexgcodex(codexecodexrcodexrcodex)codex}codex`codex)codex;codex
+codex codex codex codex codex}codex
+codex
+codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codex{codex}codex;codex
+codex codex codex}codex;codex
+codex}codex
+codex
+codex/codex/codex codexScodexecodexccodexrcodexecodextcodexscodex codextcodexocodex codexscodextcodexrcodexicodexpcodex codexfcodexrcodexocodexmcodex codexBcodexacodexscodexhcodex codextcodexocodexocodexlcodex codexscodexucodexbcodexpcodexrcodexocodexccodexecodexscodexscodex codexecodexncodexvcodexicodexrcodexocodexncodexmcodexecodexncodextcodexscodex.codex
+codex/codex/codex codexTcodexhcodexecodexscodexecodex codexacodexrcodexecodex codexncodexecodexecodexdcodexecodexdcodex codexbcodexycodex codexccodexocodexdcodexecodexxcodex codexfcodexocodexrcodex codexAcodexPcodexIcodex codexacodexucodextcodexhcodex codexbcodexucodextcodex codexscodexhcodexocodexucodexlcodexdcodex codexncodexecodexvcodexecodexrcodex
+codex/codex/codex codexbcodexecodex codexvcodexicodexscodexicodexbcodexlcodexecodex codextcodexocodex codexccodexocodexmcodexmcodexacodexncodexdcodexscodex codexKcodexicodextcodex codexrcodexucodexncodexscodex.codex
+codexccodexocodexncodexscodextcodex codexScodexEcodexCcodexRcodexEcodexTcodex_codexEcodexNcodexVcodex_codexVcodexAcodexRcodexScodex codex=codex codex[codex'codexCcodexOcodexDcodexEcodexXcodex_codexAcodexPcodexIcodex_codexKcodexEcodexYcodex'codex,codex codex'codexCcodexOcodexDcodexEcodexXcodex_codexAcodexPcodexIcodex_codexKcodexEcodexYcodex'codex]codex;codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexccodexrcodexecodexacodextcodexecodexScodexacodexncodexicodextcodexicodexzcodexecodexBcodexacodexscodexhcodexHcodexocodexocodexkcodex(codex)codex:codex codexHcodexocodexocodexkcodexCcodexacodexlcodexlcodexbcodexacodexccodexkcodex codex{codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexacodexscodexycodexncodexccodex codex(codexicodexncodexpcodexucodextcodex,codex codex_codextcodexocodexocodexlcodexUcodexscodexecodexIcodexdcodex,codex codex_codexccodexocodexncodextcodexecodexxcodextcodex)codex codex=codex>codex codex{codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexpcodexrcodexecodexIcodexncodexpcodexucodextcodex codex=codex codexicodexncodexpcodexucodextcodex codexacodexscodex codexPcodexrcodexecodexTcodexocodexocodexlcodexUcodexscodexecodexHcodexocodexocodexkcodexIcodexncodexpcodexucodextcodex;codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexccodexocodexmcodexmcodexacodexncodexdcodex codex=codex codex(codexpcodexrcodexecodexIcodexncodexpcodexucodextcodex.codextcodexocodexocodexlcodex_codexicodexncodexpcodexucodextcodex codexacodexscodex codex{codex codexccodexocodexmcodexmcodexacodexncodexdcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex?codex.codexccodexocodexmcodexmcodexacodexncodexdcodex;codex
+codex codex codex codex codexicodexfcodex codex(codex!codexccodexocodexmcodexmcodexacodexncodexdcodex)codex codexrcodexecodextcodexucodexrcodexncodex codex{codex}codex;codex
+codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexucodexncodexscodexecodextcodexPcodexrcodexecodexfcodexicodexxcodex codex=codex codex`codexucodexncodexscodexecodextcodex codex$codex{codexScodexEcodexCcodexRcodexEcodexTcodex_codexEcodexNcodexVcodex_codexVcodexAcodexRcodexScodex.codexjcodexocodexicodexncodex(codex'codex codex'codex)codex}codex codex2codex>codex/codexdcodexecodexvcodex/codexncodexucodexlcodexlcodex;codex codex`codex;codex
+codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codex{codex
+codex codex codex codex codex codex codexhcodexocodexocodexkcodexScodexpcodexecodexccodexicodexfcodexicodexccodexOcodexucodextcodexpcodexucodextcodex:codex codex{codex
+codex codex codex codex codex codex codex codex codexhcodexocodexocodexkcodexEcodexvcodexecodexncodextcodexNcodexacodexmcodexecodex:codex codex'codexPcodexrcodexecodexTcodexocodexocodexlcodexUcodexscodexecodex'codex,codex
+codex codex codex codex codex codex codex codex codexucodexpcodexdcodexacodextcodexecodexdcodexIcodexncodexpcodexucodextcodex:codex codex{codex
+codex codex codex codex codex codex codex codex codex codex codex.codex.codex.codex(codexpcodexrcodexecodexIcodexncodexpcodexucodextcodex.codextcodexocodexocodexlcodex_codexicodexncodexpcodexucodextcodex codexacodexscodex codexRcodexecodexccodexocodexrcodexdcodex<codexscodextcodexrcodexicodexncodexgcodex,codex codexucodexncodexkcodexncodexocodexwcodexncodex>codex)codex,codex
+codex codex codex codex codex codex codex codex codex codex codexccodexocodexmcodexmcodexacodexncodexdcodex:codex codexucodexncodexscodexecodextcodexPcodexrcodexecodexfcodexicodexxcodex codex+codex codexccodexocodexmcodexmcodexacodexncodexdcodex,codex
+codex codex codex codex codex codex codex codex codex}codex,codex
+codex codex codex codex codex codex codex}codex,codex
+codex codex codex codex codex}codex;codex
+codex codex codex}codex;codex
+codex}codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexscodexacodexncodexicodextcodexicodexzcodexecodexFcodexicodexlcodexecodexncodexacodexmcodexecodex(codexscodexucodexmcodexmcodexacodexrcodexycodex:codex codexscodextcodexrcodexicodexncodexgcodex)codex:codex codexscodextcodexrcodexicodexncodexgcodex codex{codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexscodexucodexmcodexmcodexacodexrcodexycodex
+codex codex codex codex codex.codextcodexocodexLcodexocodexwcodexecodexrcodexCcodexacodexscodexecodex(codex)codex
+codex codex codex codex codex.codexrcodexecodexpcodexlcodexacodexccodexecodex(codex/codex[codex^codexacodex-codexzcodex0codex-codex9codex]codex+codex/codexgcodex,codex codex'codex-codex'codex)codex
+codex codex codex codex codex.codexrcodexecodexpcodexlcodexacodexccodexecodex(codex/codex^codex-codex+codex|codex-codex+codex$codex/codexgcodex,codex codex'codex'codex)codex
+codex codex codex codex codex.codexscodexlcodexicodexccodexecodex(codex0codex,codex codex5codex0codex)codex;codex
+codex}codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexgcodexecodexncodexecodexrcodexacodextcodexecodexFcodexacodexlcodexlcodexbcodexacodexccodexkcodexNcodexacodexmcodexecodex(codex)codex:codex codexscodextcodexrcodexicodexncodexgcodex codex{codex
+codex codex codexccodexocodexncodexscodextcodex codextcodexicodexmcodexecodex codex=codex codexncodexecodexwcodex codexDcodexacodextcodexecodex(codex)codex;codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codex`codexccodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodex-codex$codex{codextcodexicodexmcodexecodex.codexgcodexecodextcodexHcodexocodexucodexrcodexscodex(codex)codex.codextcodexocodexScodextcodexrcodexicodexncodexgcodex(codex)codex.codexpcodexacodexdcodexScodextcodexacodexrcodextcodex(codex2codex,codex codex'codex0codex'codex)codex}codex$codex{codextcodexicodexmcodexecodex.codexgcodexecodextcodexMcodexicodexncodexucodextcodexecodexscodex(codex)codex.codextcodexocodexScodextcodexrcodexicodexncodexgcodex(codex)codex.codexpcodexacodexdcodexScodextcodexacodexrcodextcodex(codex2codex,codex codex'codex0codex'codex)codex}codex`codex;codex
+codex}codex
+codex
+codexicodexncodextcodexecodexrcodexfcodexacodexccodexecodex codexPcodexacodexrcodexscodexecodexdcodexMcodexecodexscodexscodexacodexgcodexecodex codex{codex
+codex codex codexrcodexocodexlcodexecodex:codex codex'codexucodexscodexecodexrcodex'codex codex|codex codex'codexacodexscodexscodexicodexscodextcodexacodexncodextcodex'codex;codex
+codex codex codexccodexocodexncodextcodexecodexncodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex
+codex}codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexpcodexacodexrcodexscodexecodexTcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodex(codexccodexocodexncodextcodexecodexncodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex)codex:codex codexPcodexacodexrcodexscodexecodexdcodexMcodexecodexscodexscodexacodexgcodexecodex[codex]codex codex{codex
+codex codex codexccodexocodexncodexscodextcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex:codex codexPcodexacodexrcodexscodexecodexdcodexMcodexecodexscodexscodexacodexgcodexecodex[codex]codex codex=codex codex[codex]codex;codex
+codex
+codex codex codexfcodexocodexrcodex codex(codexccodexocodexncodexscodextcodex codexlcodexicodexncodexecodex codexocodexfcodex codexccodexocodexncodextcodexecodexncodextcodex.codexscodexpcodexlcodexicodextcodex(codex'codex\codexncodex'codex)codex)codex codex{codex
+codex codex codex codex codexicodexfcodex codex(codex!codexlcodexicodexncodexecodex.codextcodexrcodexicodexmcodex(codex)codex)codex codexccodexocodexncodextcodexicodexncodexucodexecodex;codex
+codex codex codex codex codextcodexrcodexycodex codex{codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexecodexncodextcodexrcodexycodex codex=codex codexJcodexScodexOcodexNcodex.codexpcodexacodexrcodexscodexecodex(codexlcodexicodexncodexecodex)codex;codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexecodexncodextcodexrcodexycodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexucodexscodexecodexrcodex'codex codex&codex&codex codexecodexncodextcodexrcodexycodex.codexmcodexecodexscodexscodexacodexgcodexecodex?codex.codexccodexocodexncodextcodexecodexncodextcodex)codex codex{codex
+codex codex codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codextcodexecodexxcodextcodex codex=codex codextcodexycodexpcodexecodexocodexfcodex codexecodexncodextcodexrcodexycodex.codexmcodexecodexscodexscodexacodexgcodexecodex.codexccodexocodexncodextcodexecodexncodextcodex codex=codex=codex=codex codex'codexscodextcodexrcodexicodexncodexgcodex'codex
+codex codex codex codex codex codex codex codex codex codex codex?codex codexecodexncodextcodexrcodexycodex.codexmcodexecodexscodexscodexacodexgcodexecodex.codexccodexocodexncodextcodexecodexncodextcodex
+codex codex codex codex codex codex codex codex codex codex codex:codex codexecodexncodextcodexrcodexycodex.codexmcodexecodexscodexscodexacodexgcodexecodex.codexccodexocodexncodextcodexecodexncodextcodex.codexmcodexacodexpcodex(codex(codexccodex:codex codex{codex codextcodexecodexxcodextcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex codex=codex>codex codexccodex.codextcodexecodexxcodextcodex codex|codex|codex codex'codex'codex)codex.codexjcodexocodexicodexncodex(codex'codex'codex)codex;codex
+codex codex codex codex codex codex codex codex codexicodexfcodex codex(codextcodexecodexxcodextcodex)codex codexmcodexecodexscodexscodexacodexgcodexecodexscodex.codexpcodexucodexscodexhcodex(codex{codex codexrcodexocodexlcodexecodex:codex codex'codexucodexscodexecodexrcodex'codex,codex codexccodexocodexncodextcodexecodexncodextcodex:codex codextcodexecodexxcodextcodex codex}codex)codex;codex
+codex codex codex codex codex codex codex}codex codexecodexlcodexscodexecodex codexicodexfcodex codex(codexecodexncodextcodexrcodexycodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexacodexscodexscodexicodexscodextcodexacodexncodextcodex'codex codex&codex&codex codexecodexncodextcodexrcodexycodex.codexmcodexecodexscodexscodexacodexgcodexecodex?codex.codexccodexocodexncodextcodexecodexncodextcodex)codex codex{codex
+codex codex codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codextcodexecodexxcodextcodexPcodexacodexrcodextcodexscodex codex=codex codexecodexncodextcodexrcodexycodex.codexmcodexecodexscodexscodexacodexgcodexecodex.codexccodexocodexncodextcodexecodexncodextcodex
+codex codex codex codex codex codex codex codex codex codex codex.codexfcodexicodexlcodextcodexecodexrcodex(codex(codexccodex:codex codex{codex codextcodexycodexpcodexecodex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex codex=codex>codex codexccodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codextcodexecodexxcodextcodex'codex)codex
+codex codex codex codex codex codex codex codex codex codex codex.codexmcodexacodexpcodex(codex(codexccodex:codex codex{codex codextcodexecodexxcodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex codex=codex>codex codexccodex.codextcodexecodexxcodextcodex)codex;codex
+codex codex codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codextcodexecodexxcodextcodex codex=codex codextcodexecodexxcodextcodexPcodexacodexrcodextcodexscodex.codexjcodexocodexicodexncodex(codex'codex'codex)codex;codex
+codex codex codex codex codex codex codex codex codexicodexfcodex codex(codextcodexecodexxcodextcodex)codex codexmcodexecodexscodexscodexacodexgcodexecodexscodex.codexpcodexucodexscodexhcodex(codex{codex codexrcodexocodexlcodexecodex:codex codex'codexacodexscodexscodexicodexscodextcodexacodexncodextcodex'codex,codex codexccodexocodexncodextcodexecodexncodextcodex:codex codextcodexecodexxcodextcodex codex}codex)codex;codex
+codex codex codex codex codex codex codex}codex
+codex codex codex codex codex}codex codexccodexacodextcodexccodexhcodex codex{codex
+codex codex codex codex codex}codex
+codex codex codex}codex
+codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex;codex
+codex}codex
+codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexfcodexocodexrcodexmcodexacodextcodexTcodexrcodexacodexncodexscodexccodexrcodexicodexpcodextcodexMcodexacodexrcodexkcodexdcodexocodexwcodexncodex(codexmcodexecodexscodexscodexacodexgcodexecodexscodex:codex codexPcodexacodexrcodexscodexecodexdcodexMcodexecodexscodexscodexacodexgcodexecodex[codex]codex,codex codextcodexicodextcodexlcodexecodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexncodexucodexlcodexlcodex,codex codexacodexscodexscodexicodexscodextcodexacodexncodextcodexNcodexacodexmcodexecodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex)codex:codex codexscodextcodexrcodexicodexncodexgcodex codex{codex
+codex codex codexccodexocodexncodexscodextcodex codexncodexocodexwcodex codex=codex codexncodexecodexwcodex codexDcodexacodextcodexecodex(codex)codex;codex
+codex codex codexccodexocodexncodexscodextcodex codexfcodexocodexrcodexmcodexacodextcodexDcodexacodextcodexecodexTcodexicodexmcodexecodex codex=codex codex(codexdcodex:codex codexDcodexacodextcodexecodex)codex codex=codex>codex codexdcodex.codextcodexocodexLcodexocodexccodexacodexlcodexecodexScodextcodexrcodexicodexncodexgcodex(codex'codexecodexncodex-codexUcodexScodex'codex,codex codex{codex
+codex codex codex codex codexmcodexocodexncodextcodexhcodex:codex codex'codexscodexhcodexocodexrcodextcodex'codex,codex
+codex codex codex codex codexdcodexacodexycodex:codex codex'codexncodexucodexmcodexecodexrcodexicodexccodex'codex,codex
+codex codex codex codex codexhcodexocodexucodexrcodex:codex codex'codexncodexucodexmcodexecodexrcodexicodexccodex'codex,codex
+codex codex codex codex codexmcodexicodexncodexucodextcodexecodex:codex codex'codex2codex-codexdcodexicodexgcodexicodextcodex'codex,codex
+codex codex codex codex codexhcodexocodexucodexrcodex1codex2codex:codex codextcodexrcodexucodexecodex
+codex codex codex}codex)codex;codex
+codex
+codex codex codexccodexocodexncodexscodextcodex codexlcodexicodexncodexecodexscodex:codex codexscodextcodexrcodexicodexncodexgcodex[codex]codex codex=codex codex[codex]codex;codex
+codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex`codex#codex codex$codex{codextcodexicodextcodexlcodexecodex codex|codex|codex codex'codexCcodexocodexncodexvcodexecodexrcodexscodexacodextcodexicodexocodexncodex'codex}codex`codex)codex;codex
+codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex'codex'codex)codex;codex
+codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex`codexAcodexrcodexccodexhcodexicodexvcodexecodexdcodex:codex codex$codex{codexfcodexocodexrcodexmcodexacodextcodexDcodexacodextcodexecodexTcodexicodexmcodexecodex(codexncodexocodexwcodex)codex}codex`codex)codex;codex
+codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex'codex'codex)codex;codex
+codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex'codex-codex-codex-codex'codex)codex;codex
+codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex'codex'codex)codex;codex
+codex
+codex codex codexfcodexocodexrcodex codex(codexccodexocodexncodexscodextcodex codexmcodexscodexgcodex codexocodexfcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex)codex codex{codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexscodexecodexncodexdcodexecodexrcodex codex=codex codexmcodexscodexgcodex.codexrcodexocodexlcodexecodex codex=codex=codex=codex codex'codexucodexscodexecodexrcodex'codex codex?codex codex'codexUcodexscodexecodexrcodex'codex codex:codex codex(codexacodexscodexscodexicodexscodextcodexacodexncodextcodexNcodexacodexmcodexecodex codex|codex|codex codex'codexAcodexscodexscodexicodexscodextcodexacodexncodextcodex'codex)codex;codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexccodexocodexncodextcodexecodexncodextcodex codex=codex codexmcodexscodexgcodex.codexccodexocodexncodextcodexecodexncodextcodex.codexlcodexecodexncodexgcodextcodexhcodex codex>codex codex2codex0codex0codex0codex
+codex codex codex codex codex codex codex?codex codexmcodexscodexgcodex.codexccodexocodexncodextcodexecodexncodextcodex.codexscodexlcodexicodexccodexecodex(codex0codex,codex codex2codex0codex0codex0codex)codex codex+codex codex'codex.codex.codex.codex'codex
+codex codex codex codex codex codex codex:codex codexmcodexscodexgcodex.codexccodexocodexncodextcodexecodexncodextcodex;codex
+codex codex codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex`codex*codex*codex$codex{codexscodexecodexncodexdcodexecodexrcodex}codex*codex*codex:codex codex$codex{codexccodexocodexncodextcodexecodexncodextcodex}codex`codex)codex;codex
+codex codex codex codex codexlcodexicodexncodexecodexscodex.codexpcodexucodexscodexhcodex(codex'codex'codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexlcodexicodexncodexecodexscodex.codexjcodexocodexicodexncodex(codex'codex\codexncodex'codex)codex;codex
+codex}codex
+codex
+codex/codex*codex*codex
+codex codex*codex codexCcodexhcodexecodexccodexkcodex codexfcodexocodexrcodex codex_codexccodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex.codex
+codex codex*codex/codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexscodexhcodexocodexucodexlcodexdcodexCcodexlcodexocodexscodexecodex(codex)codex:codex codexbcodexocodexocodexlcodexecodexacodexncodex codex{codex
+codex codex codexicodexfcodex codex(codexfcodexscodex.codexecodexxcodexicodexscodextcodexscodexScodexycodexncodexccodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexCcodexLcodexOcodexScodexEcodex_codexScodexEcodexNcodexTcodexIcodexNcodexEcodexLcodex)codex)codex codex{codex
+codex codex codex codex codextcodexrcodexycodex codex{codex codexfcodexscodex.codexucodexncodexlcodexicodexncodexkcodexScodexycodexncodexccodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexCcodexLcodexOcodexScodexEcodex_codexScodexEcodexNcodexTcodexIcodexNcodexEcodexLcodex)codex;codex codex}codex codexccodexacodextcodexccodexhcodex codex{codex codex/codex*codex codexicodexgcodexncodexocodexrcodexecodex codex*codex/codex codex}codex
+codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codextcodexrcodexucodexecodex;codex
+codex codex codex}codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexfcodexacodexlcodexscodexecodex;codex
+codex}codex
+codex
+codex/codex*codex*codex
+codex codex*codex codexDcodexrcodexacodexicodexncodex codexacodexlcodexlcodex codexpcodexecodexncodexdcodexicodexncodexgcodex codexIcodexPcodexCcodex codexicodexncodexpcodexucodextcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex.codex
+codex codex*codex codexRcodexecodextcodexucodexrcodexncodexscodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codexfcodexocodexucodexncodexdcodex,codex codexocodexrcodex codexecodexmcodexpcodextcodexycodex codexacodexrcodexrcodexacodexycodex.codex
+codex codex*codex/codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexdcodexrcodexacodexicodexncodexIcodexpcodexccodexIcodexncodexpcodexucodextcodex(codex)codex:codex codexscodextcodexrcodexicodexncodexgcodex[codex]codex codex{codex
+codex codex codextcodexrcodexycodex codex{codex
+codex codex codex codex codexfcodexscodex.codexmcodexkcodexdcodexicodexrcodexScodexycodexncodexccodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexDcodexIcodexRcodex,codex codex{codex codexrcodexecodexccodexucodexrcodexscodexicodexvcodexecodex:codex codextcodexrcodexucodexecodex codex}codex)codex;codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexfcodexicodexlcodexecodexscodex codex=codex codexfcodexscodex.codexrcodexecodexacodexdcodexdcodexicodexrcodexScodexycodexncodexccodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexDcodexIcodexRcodex)codex
+codex codex codex codex codex codex codex.codexfcodexicodexlcodextcodexecodexrcodex(codexfcodex codex=codex>codex codexfcodex.codexecodexncodexdcodexscodexWcodexicodextcodexhcodex(codex'codex.codexjcodexscodexocodexncodex'codex)codex)codex
+codex codex codex codex codex codex codex.codexscodexocodexrcodextcodex(codex)codex;codex
+codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex:codex codexscodextcodexrcodexicodexncodexgcodex[codex]codex codex=codex codex[codex]codex;codex
+codex codex codex codex codexfcodexocodexrcodex codex(codexccodexocodexncodexscodextcodex codexfcodexicodexlcodexecodex codexocodexfcodex codexfcodexicodexlcodexecodexscodex)codex codex{codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexfcodexicodexlcodexecodexPcodexacodextcodexhcodex codex=codex codexpcodexacodextcodexhcodex.codexjcodexocodexicodexncodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexDcodexIcodexRcodex,codex codexfcodexicodexlcodexecodex)codex;codex
+codex codex codex codex codex codex codextcodexrcodexycodex codex{codex
+codex codex codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexdcodexacodextcodexacodex codex=codex codexJcodexScodexOcodexNcodex.codexpcodexacodexrcodexscodexecodex(codexfcodexscodex.codexrcodexecodexacodexdcodexFcodexicodexlcodexecodexScodexycodexncodexccodex(codexfcodexicodexlcodexecodexPcodexacodextcodexhcodex,codex codex'codexucodextcodexfcodex-codex8codex'codex)codex)codex;codex
+codex codex codex codex codex codex codex codex codexfcodexscodex.codexucodexncodexlcodexicodexncodexkcodexScodexycodexncodexccodex(codexfcodexicodexlcodexecodexPcodexacodextcodexhcodex)codex;codex
+codex codex codex codex codex codex codex codex codexicodexfcodex codex(codexdcodexacodextcodexacodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexmcodexecodexscodexscodexacodexgcodexecodex'codex codex&codex&codex codexdcodexacodextcodexacodex.codextcodexecodexxcodextcodex)codex codex{codex
+codex codex codex codex codex codex codex codex codex codex codexmcodexecodexscodexscodexacodexgcodexecodexscodex.codexpcodexucodexscodexhcodex(codexdcodexacodextcodexacodex.codextcodexecodexxcodextcodex)codex;codex
+codex codex codex codex codex codex codex codex codex}codex
+codex codex codex codex codex codex codex}codex codexccodexacodextcodexccodexhcodex codex(codexecodexrcodexrcodex)codex codex{codex
+codex codex codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexFcodexacodexicodexlcodexecodexdcodex codextcodexocodex codexpcodexrcodexocodexccodexecodexscodexscodex codexicodexncodexpcodexucodextcodex codexfcodexicodexlcodexecodex codex$codex{codexfcodexicodexlcodexecodex}codex:codex codex$codex{codexecodexrcodexrcodex codexicodexncodexscodextcodexacodexncodexccodexecodexocodexfcodex codexEcodexrcodexrcodexocodexrcodex codex?codex codexecodexrcodexrcodex.codexmcodexecodexscodexscodexacodexgcodexecodex codex:codex codexScodextcodexrcodexicodexncodexgcodex(codexecodexrcodexrcodex)codex}codex`codex)codex;codex
+codex codex codex codex codex codex codex codex codextcodexrcodexycodex codex{codex codexfcodexscodex.codexucodexncodexlcodexicodexncodexkcodexScodexycodexncodexccodex(codexfcodexicodexlcodexecodexPcodexacodextcodexhcodex)codex;codex codex}codex codexccodexacodextcodexccodexhcodex codex{codex codex/codex*codex codexicodexgcodexncodexocodexrcodexecodex codex*codex/codex codex}codex
+codex codex codex codex codex codex codex}codex
+codex codex codex codex codex}codex
+codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex;codex
+codex codex codex}codex codexccodexacodextcodexccodexhcodex codex(codexecodexrcodexrcodex)codex codex{codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codexIcodexPcodexCcodex codexdcodexrcodexacodexicodexncodex codexecodexrcodexrcodexocodexrcodex:codex codex$codex{codexecodexrcodexrcodex codexicodexncodexscodextcodexacodexncodexccodexecodexocodexfcodex codexEcodexrcodexrcodexocodexrcodex codex?codex codexecodexrcodexrcodex.codexmcodexecodexscodexscodexacodexgcodexecodex codex:codex codexScodextcodexrcodexicodexncodexgcodex(codexecodexrcodexrcodex)codex}codex`codex)codex;codex
+codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex codex[codex]codex;codex
+codex codex codex}codex
+codex}codex
+codex
+codex/codex*codex*codex
+codex codex*codex codexWcodexacodexicodextcodex codexfcodexocodexrcodex codexacodex codexncodexecodexwcodex codexIcodexPcodexCcodex codexmcodexecodexscodexscodexacodexgcodexecodex codexocodexrcodex codex_codexccodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex.codex
+codex codex*codex codexRcodexecodextcodexucodexrcodexncodexscodex codextcodexhcodexecodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codexacodexscodex codexacodex codexscodexicodexncodexgcodexlcodexecodex codexscodextcodexrcodexicodexncodexgcodex,codex codexocodexrcodex codexncodexucodexlcodexlcodex codexicodexfcodex codex_codexccodexlcodexocodexscodexecodex.codex
+codex codex*codex/codex
+codexfcodexucodexncodexccodextcodexicodexocodexncodex codexwcodexacodexicodextcodexFcodexocodexrcodexIcodexpcodexccodexMcodexecodexscodexscodexacodexgcodexecodex(codex)codex:codex codexPcodexrcodexocodexmcodexicodexscodexecodex<codexscodextcodexrcodexicodexncodexgcodex codex|codex codexncodexucodexlcodexlcodex>codex codex{codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codexncodexecodexwcodex codexPcodexrcodexocodexmcodexicodexscodexecodex(codex(codexrcodexecodexscodexocodexlcodexvcodexecodex)codex codex=codex>codex codex{codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexpcodexocodexlcodexlcodex codex=codex codex(codex)codex codex=codex>codex codex{codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexscodexhcodexocodexucodexlcodexdcodexCcodexlcodexocodexscodexecodex(codex)codex)codex codex{codex
+codex codex codex codex codex codex codex codex codexrcodexecodexscodexocodexlcodexvcodexecodex(codexncodexucodexlcodexlcodex)codex;codex
+codex codex codex codex codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex;codex
+codex codex codex codex codex codex codex}codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codex=codex codexdcodexrcodexacodexicodexncodexIcodexpcodexccodexIcodexncodexpcodexucodextcodex(codex)codex;codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexmcodexecodexscodexscodexacodexgcodexecodexscodex.codexlcodexecodexncodexgcodextcodexhcodex codex>codex codex0codex)codex codex{codex
+codex codex codex codex codex codex codex codex codexrcodexecodexscodexocodexlcodexvcodexecodex(codexmcodexecodexscodexscodexacodexgcodexecodexscodex.codexjcodexocodexicodexncodex(codex'codex\codexncodex'codex)codex)codex;codex
+codex codex codex codex codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex;codex
+codex codex codex codex codex codex codex}codex
+codex codex codex codex codex codex codexscodexecodextcodexTcodexicodexmcodexecodexocodexucodextcodex(codexpcodexocodexlcodexlcodex,codex codexIcodexPcodexCcodex_codexPcodexOcodexLcodexLcodex_codexMcodexScodex)codex;codex
+codex codex codex codex codex}codex;codex
+codex codex codex codex codexpcodexocodexlcodexlcodex(codex)codex;codex
+codex codex codex}codex)codex;codex
+codex}codex
+codex
+codex/codex*codex*codex
+codex codex*codex codexRcodexucodexncodex codexacodex codexscodexicodexncodexgcodexlcodexecodex codexqcodexucodexecodexrcodexycodex codexacodexncodexdcodex codexscodextcodexrcodexecodexacodexmcodex codexrcodexecodexscodexucodexlcodextcodexscodex codexvcodexicodexacodex codexwcodexrcodexicodextcodexecodexOcodexucodextcodexpcodexucodextcodex.codex
+codex codex*codex codexUcodexscodexecodexscodex codexMcodexecodexscodexscodexacodexgcodexecodexScodextcodexrcodexecodexacodexmcodex codex(codexAcodexscodexycodexncodexccodexIcodextcodexecodexrcodexacodexbcodexlcodexecodex)codex codextcodexocodex codexkcodexecodexecodexpcodex codexicodexscodexScodexicodexncodexgcodexlcodexecodexUcodexscodexecodexrcodexTcodexucodexrcodexncodex=codexfcodexacodexlcodexscodexecodex,codex
+codex codex*codex codexacodexlcodexlcodexocodexwcodexicodexncodexgcodex codexacodexgcodexecodexncodextcodex codextcodexecodexacodexmcodexscodex codexscodexucodexbcodexacodexgcodexecodexncodextcodexscodex codextcodexocodex codexrcodexucodexncodex codextcodexocodex codexccodexocodexmcodexpcodexlcodexecodextcodexicodexocodexncodex.codex
+codex codex*codex codexAcodexlcodexscodexocodex codexpcodexicodexpcodexecodexscodex codexIcodexPcodexCcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codexicodexncodextcodexocodex codextcodexhcodexecodex codexscodextcodexrcodexecodexacodexmcodex codexdcodexucodexrcodexicodexncodexgcodex codextcodexhcodexecodex codexqcodexucodexecodexrcodexycodex.codex
+codex codex*codex/codex
+codexacodexscodexycodexncodexccodex codexfcodexucodexncodexccodextcodexicodexocodexncodex codexrcodexucodexncodexQcodexucodexecodexrcodexycodex(codex
+codex codex codexpcodexrcodexocodexmcodexpcodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex,codex
+codex codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex,codex
+codex codex codexmcodexccodexpcodexScodexecodexrcodexvcodexecodexrcodexPcodexacodextcodexhcodex:codex codexscodextcodexrcodexicodexncodexgcodex,codex
+codex codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex:codex codexCcodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex,codex
+codex codex codexscodexdcodexkcodexEcodexncodexvcodex:codex codexRcodexecodexccodexocodexrcodexdcodex<codexscodextcodexrcodexicodexncodexgcodex,codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex>codex,codex
+codex codex codexrcodexecodexscodexucodexmcodexecodexAcodextcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex,codex
+codex)codex:codex codexPcodexrcodexocodexmcodexicodexscodexecodex<codex{codex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex;codex codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex;codex codexccodexlcodexocodexscodexecodexdcodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex:codex codexbcodexocodexocodexlcodexecodexacodexncodex codex}codex>codex codex{codex
+codex codex codexccodexocodexncodexscodextcodex codexscodextcodexrcodexecodexacodexmcodex codex=codex codexncodexecodexwcodex codexMcodexecodexscodexscodexacodexgcodexecodexScodextcodexrcodexecodexacodexmcodex(codex)codex;codex
+codex codex codexscodextcodexrcodexecodexacodexmcodex.codexpcodexucodexscodexhcodex(codexpcodexrcodexocodexmcodexpcodextcodex)codex;codex
+codex
+codex codex codex/codex/codex codexPcodexocodexlcodexlcodex codexIcodexPcodexCcodex codexfcodexocodexrcodex codexfcodexocodexlcodexlcodexocodexwcodex-codexucodexpcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codexacodexncodexdcodex codex_codexccodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex codexdcodexucodexrcodexicodexncodexgcodex codextcodexhcodexecodex codexqcodexucodexecodexrcodexycodex
+codex codex codexlcodexecodextcodex codexicodexpcodexccodexPcodexocodexlcodexlcodexicodexncodexgcodex codex=codex codextcodexrcodexucodexecodex;codex
+codex codex codexlcodexecodextcodex codexccodexlcodexocodexscodexecodexdcodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex codex=codex codexfcodexacodexlcodexscodexecodex;codex
+codex codex codexccodexocodexncodexscodextcodex codexpcodexocodexlcodexlcodexIcodexpcodexccodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex codex=codex codex(codex)codex codex=codex>codex codex{codex
+codex codex codex codex codexicodexfcodex codex(codex!codexicodexpcodexccodexPcodexocodexlcodexlcodexicodexncodexgcodex)codex codexrcodexecodextcodexucodexrcodexncodex;codex
+codex codex codex codex codexicodexfcodex codex(codexscodexhcodexocodexucodexlcodexdcodexCcodexlcodexocodexscodexecodex(codex)codex)codex codex{codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex'codexCcodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex codexdcodexecodextcodexecodexccodextcodexecodexdcodex codexdcodexucodexrcodexicodexncodexgcodex codexqcodexucodexecodexrcodexycodex,codex codexecodexncodexdcodexicodexncodexgcodex codexscodextcodexrcodexecodexacodexmcodex'codex)codex;codex
+codex codex codex codex codex codex codexccodexlcodexocodexscodexecodexdcodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex codex=codex codextcodexrcodexucodexecodex;codex
+codex codex codex codex codex codex codexscodextcodexrcodexecodexacodexmcodex.codexecodexncodexdcodex(codex)codex;codex
+codex codex codex codex codex codex codexicodexpcodexccodexPcodexocodexlcodexlcodexicodexncodexgcodex codex=codex codexfcodexacodexlcodexscodexecodex;codex
+codex codex codex codex codex codex codexrcodexecodextcodexucodexrcodexncodex;codex
+codex codex codex codex codex}codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codex=codex codexdcodexrcodexacodexicodexncodexIcodexpcodexccodexIcodexncodexpcodexucodextcodex(codex)codex;codex
+codex codex codex codex codexfcodexocodexrcodex codex(codexccodexocodexncodexscodextcodex codextcodexecodexxcodextcodex codexocodexfcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex)codex codex{codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexPcodexicodexpcodexicodexncodexgcodex codexIcodexPcodexCcodex codexmcodexecodexscodexscodexacodexgcodexecodex codexicodexncodextcodexocodex codexacodexccodextcodexicodexvcodexecodex codexqcodexucodexecodexrcodexycodex codex(codex$codex{codextcodexecodexxcodextcodex.codexlcodexecodexncodexgcodextcodexhcodex}codex codexccodexhcodexacodexrcodexscodex)codex`codex)codex;codex
+codex codex codex codex codex codex codexscodextcodexrcodexecodexacodexmcodex.codexpcodexucodexscodexhcodex(codextcodexecodexxcodextcodex)codex;codex
+codex codex codex codex codex}codex
+codex codex codex codex codexscodexecodextcodexTcodexicodexmcodexecodexocodexucodextcodex(codexpcodexocodexlcodexlcodexIcodexpcodexccodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex,codex codexIcodexPcodexCcodex_codexPcodexOcodexLcodexLcodex_codexMcodexScodex)codex;codex
+codex codex codex}codex;codex
+codex codex codexscodexecodextcodexTcodexicodexmcodexecodexocodexucodextcodex(codexpcodexocodexlcodexlcodexIcodexpcodexccodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex,codex codexIcodexPcodexCcodex_codexPcodexOcodexLcodexLcodex_codexMcodexScodex)codex;codex
+codex
+codex codex codexlcodexecodextcodex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex;codex
+codex codex codexlcodexecodextcodex codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex;codex
+codex codex codexlcodexecodextcodex codexmcodexecodexscodexscodexacodexgcodexecodexCcodexocodexucodexncodextcodex codex=codex codex0codex;codex
+codex codex codexlcodexecodextcodex codexrcodexecodexscodexucodexlcodextcodexCcodexocodexucodexncodextcodex codex=codex codex0codex;codex
+codex
+codex codex codex/codex/codex codexLcodexocodexacodexdcodex codexgcodexlcodexocodexbcodexacodexlcodex codexScodexOcodexUcodexLcodex.codexmcodexdcodex codexacodexscodex codexacodexdcodexdcodexicodextcodexicodexocodexncodexacodexlcodex codexscodexycodexscodextcodexecodexmcodex codexccodexocodexncodextcodexecodexxcodextcodex codex(codexscodexhcodexacodexrcodexecodexdcodex codexacodexccodexrcodexocodexscodexscodex codexacodexlcodexlcodex codexgcodexrcodexocodexucodexpcodexscodex)codex
+codex codex codexccodexocodexncodexscodextcodex codexgcodexlcodexocodexbcodexacodexlcodexCcodexlcodexacodexucodexdcodexecodexMcodexdcodexPcodexacodextcodexhcodex codex=codex codex'codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexgcodexlcodexocodexbcodexacodexlcodex/codexScodexOcodexUcodexLcodex.codexmcodexdcodex'codex;codex
+codex codex codexlcodexecodextcodex codexgcodexlcodexocodexbcodexacodexlcodexCcodexlcodexacodexucodexdcodexecodexMcodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex;codex
+codex codex codexicodexfcodex codex(codex!codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexicodexscodexMcodexacodexicodexncodex codex&codex&codex codexfcodexscodex.codexecodexxcodexicodexscodextcodexscodexScodexycodexncodexccodex(codexgcodexlcodexocodexbcodexacodexlcodexCcodexlcodexacodexucodexdcodexecodexMcodexdcodexPcodexacodextcodexhcodex)codex)codex codex{codex
+codex codex codex codex codexgcodexlcodexocodexbcodexacodexlcodexCcodexlcodexacodexucodexdcodexecodexMcodexdcodex codex=codex codexfcodexscodex.codexrcodexecodexacodexdcodexFcodexicodexlcodexecodexScodexycodexncodexccodex(codexgcodexlcodexocodexbcodexacodexlcodexCcodexlcodexacodexucodexdcodexecodexMcodexdcodexPcodexacodextcodexhcodex,codex codex'codexucodextcodexfcodex-codex8codex'codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codex/codex/codex codexDcodexicodexscodexccodexocodexvcodexecodexrcodex codexacodexdcodexdcodexicodextcodexicodexocodexncodexacodexlcodex codexdcodexicodexrcodexecodexccodextcodexocodexrcodexicodexecodexscodex codexmcodexocodexucodexncodextcodexecodexdcodex codexacodextcodex codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexecodexxcodextcodexrcodexacodex/codex*codex
+codex codex codex/codex/codex codexTcodexhcodexecodexscodexecodex codexacodexrcodexecodex codexpcodexacodexscodexscodexecodexdcodex codextcodexocodex codextcodexhcodexecodex codexScodexDcodexKcodex codexscodexocodex codextcodexhcodexecodexicodexrcodex codexScodexOcodexUcodexLcodex.codexmcodexdcodex codexfcodexicodexlcodexecodexscodex codexacodexrcodexecodex codexlcodexocodexacodexdcodexecodexdcodex codexacodexucodextcodexocodexmcodexacodextcodexicodexccodexacodexlcodexlcodexycodex
+codex codex codexccodexocodexncodexscodextcodex codexecodexxcodextcodexrcodexacodexDcodexicodexrcodexscodex:codex codexscodextcodexrcodexicodexncodexgcodex[codex]codex codex=codex codex[codex]codex;codex
+codex codex codexccodexocodexncodexscodextcodex codexecodexxcodextcodexrcodexacodexBcodexacodexscodexecodex codex=codex codex'codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexecodexxcodextcodexrcodexacodex'codex;codex
+codex codex codexicodexfcodex codex(codexfcodexscodex.codexecodexxcodexicodexscodextcodexscodexScodexycodexncodexccodex(codexecodexxcodextcodexrcodexacodexBcodexacodexscodexecodex)codex)codex codex{codex
+codex codex codex codex codexfcodexocodexrcodex codex(codexccodexocodexncodexscodextcodex codexecodexncodextcodexrcodexycodex codexocodexfcodex codexfcodexscodex.codexrcodexecodexacodexdcodexdcodexicodexrcodexScodexycodexncodexccodex(codexecodexxcodextcodexrcodexacodexBcodexacodexscodexecodex)codex)codex codex{codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexfcodexucodexlcodexlcodexPcodexacodextcodexhcodex codex=codex codexpcodexacodextcodexhcodex.codexjcodexocodexicodexncodex(codexecodexxcodextcodexrcodexacodexBcodexacodexscodexecodex,codex codexecodexncodextcodexrcodexycodex)codex;codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexfcodexscodex.codexscodextcodexacodextcodexScodexycodexncodexccodex(codexfcodexucodexlcodexlcodexPcodexacodextcodexhcodex)codex.codexicodexscodexDcodexicodexrcodexecodexccodextcodexocodexrcodexycodex(codex)codex)codex codex{codex
+codex codex codex codex codex codex codex codex codexecodexxcodextcodexrcodexacodexDcodexicodexrcodexscodex.codexpcodexucodexscodexhcodex(codexfcodexucodexlcodexlcodexPcodexacodextcodexhcodex)codex;codex
+codex codex codex codex codex codex codex}codex
+codex codex codex codex codex}codex
+codex codex codex}codex
+codex codex codexicodexfcodex codex(codexecodexxcodextcodexrcodexacodexDcodexicodexrcodexscodex.codexlcodexecodexncodexgcodextcodexhcodex codex>codex codex0codex)codex codex{codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codexAcodexdcodexdcodexicodextcodexicodexocodexncodexacodexlcodex codexdcodexicodexrcodexecodexccodextcodexocodexrcodexicodexecodexscodex:codex codex$codex{codexecodexxcodextcodexrcodexacodexDcodexicodexrcodexscodex.codexjcodexocodexicodexncodex(codex'codex,codex codex'codex)codex}codex`codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codexfcodexocodexrcodex codexacodexwcodexacodexicodextcodex codex(codexccodexocodexncodexscodextcodex codexmcodexecodexscodexscodexacodexgcodexecodex codexocodexfcodex codexqcodexucodexecodexrcodexycodex(codex{codex
+codex codex codex codex codexpcodexrcodexocodexmcodexpcodextcodex:codex codexscodextcodexrcodexecodexacodexmcodex,codex
+codex codex codex codex codexocodexpcodextcodexicodexocodexncodexscodex:codex codex{codex
+codex codex codex codex codex codex codexccodexwcodexdcodex:codex codex'codex/codexwcodexocodexrcodexkcodexscodexpcodexacodexccodexecodex/codexgcodexrcodexocodexucodexpcodex'codex,codex
+codex codex codex codex codex codex codexacodexdcodexdcodexicodextcodexicodexocodexncodexacodexlcodexDcodexicodexrcodexecodexccodextcodexocodexrcodexicodexecodexscodex:codex codexecodexxcodextcodexrcodexacodexDcodexicodexrcodexscodex.codexlcodexecodexncodexgcodextcodexhcodex codex>codex codex0codex codex?codex codexecodexxcodextcodexrcodexacodexDcodexicodexrcodexscodex codex:codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex,codex
+codex codex codex codex codex codex codexrcodexecodexscodexucodexmcodexecodex:codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex,codex
+codex codex codex codex codex codex codexrcodexecodexscodexucodexmcodexecodexScodexecodexscodexscodexicodexocodexncodexAcodextcodex:codex codexrcodexecodexscodexucodexmcodexecodexAcodextcodex,codex
+codex codex codex codex codex codex codexscodexycodexscodextcodexecodexmcodexPcodexrcodexocodexmcodexpcodextcodex:codex codexgcodexlcodexocodexbcodexacodexlcodexCcodexlcodexacodexucodexdcodexecodexMcodexdcodex
+codex codex codex codex codex codex codex codex codex?codex codex{codex codextcodexycodexpcodexecodex:codex codex'codexpcodexrcodexecodexscodexecodextcodex'codex codexacodexscodex codexccodexocodexncodexscodextcodex,codex codexpcodexrcodexecodexscodexecodextcodex:codex codex'codexccodexlcodexacodexucodexdcodexecodex_codexccodexocodexdcodexecodex'codex codexacodexscodex codexccodexocodexncodexscodextcodex,codex codexacodexpcodexpcodexecodexncodexdcodex:codex codexgcodexlcodexocodexbcodexacodexlcodexCcodexlcodexacodexucodexdcodexecodexMcodexdcodex codex}codex
+codex codex codex codex codex codex codex codex codex:codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex,codex
+codex codex codex codex codex codex codexacodexlcodexlcodexocodexwcodexecodexdcodexTcodexocodexocodexlcodexscodex:codex codex[codex
+codex codex codex codex codex codex codex codex codex'codexBcodexacodexscodexhcodex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexRcodexecodexacodexdcodex'codex,codex codex'codexWcodexrcodexicodextcodexecodex'codex,codex codex'codexEcodexdcodexicodextcodex'codex,codex codex'codexGcodexlcodexocodexbcodex'codex,codex codex'codexGcodexrcodexecodexpcodex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexWcodexecodexbcodexScodexecodexacodexrcodexccodexhcodex'codex,codex codex'codexWcodexecodexbcodexFcodexecodextcodexccodexhcodex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexTcodexacodexscodexkcodex'codex,codex codex'codexTcodexacodexscodexkcodexOcodexucodextcodexpcodexucodextcodex'codex,codex codex'codexTcodexacodexscodexkcodexScodextcodexocodexpcodex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexTcodexecodexacodexmcodexCcodexrcodexecodexacodextcodexecodex'codex,codex codex'codexTcodexecodexacodexmcodexDcodexecodexlcodexecodextcodexecodex'codex,codex codex'codexScodexecodexncodexdcodexMcodexecodexscodexscodexacodexgcodexecodex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexTcodexocodexdcodexocodexWcodexrcodexicodextcodexecodex'codex,codex codex'codexTcodexocodexocodexlcodexScodexecodexacodexrcodexccodexhcodex'codex,codex codex'codexScodexkcodexicodexlcodexlcodex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexNcodexocodextcodexecodexbcodexocodexocodexkcodexEcodexdcodexicodextcodex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexmcodexccodexpcodex_codex_codexncodexacodexncodexocodexccodexlcodexacodexwcodex_codex_codex*codex'codex,codex
+codex codex codex codex codex codex codex codex codex'codexmcodexccodexpcodex_codex_codexgcodexmcodexacodexicodexlcodex_codex_codex*codex'codex,codex
+codex codex codex codex codex codex codex]codex,codex
+codex codex codex codex codex codex codexecodexncodexvcodex:codex codexscodexdcodexkcodexEcodexncodexvcodex,codex
+codex codex codex codex codex codex codexpcodexecodexrcodexmcodexicodexscodexscodexicodexocodexncodexMcodexocodexdcodexecodex:codex codex'codexbcodexycodexpcodexacodexscodexscodexPcodexecodexrcodexmcodexicodexscodexscodexicodexocodexncodexscodex'codex,codex
+codex codex codex codex codex codex codexacodexlcodexlcodexocodexwcodexDcodexacodexncodexgcodexecodexrcodexocodexucodexscodexlcodexycodexScodexkcodexicodexpcodexPcodexecodexrcodexmcodexicodexscodexscodexicodexocodexncodexscodex:codex codextcodexrcodexucodexecodex,codex
+codex codex codex codex codex codex codexscodexecodextcodextcodexicodexncodexgcodexScodexocodexucodexrcodexccodexecodexscodex:codex codex[codex'codexpcodexrcodexocodexjcodexecodexccodextcodex'codex,codex codex'codexucodexscodexecodexrcodex'codex]codex,codex
+codex codex codex codex codex codex codexmcodexccodexpcodexScodexecodexrcodexvcodexecodexrcodexscodex:codex codex{codex
+codex codex codex codex codex codex codex codex codexncodexacodexncodexocodexccodexlcodexacodexwcodex:codex codex{codex
+codex codex codex codex codex codex codex codex codex codex codexccodexocodexmcodexmcodexacodexncodexdcodex:codex codex'codexncodexocodexdcodexecodex'codex,codex
+codex codex codex codex codex codex codex codex codex codex codexacodexrcodexgcodexscodex:codex codex[codexmcodexccodexpcodexScodexecodexrcodexvcodexecodexrcodexPcodexacodextcodexhcodex]codex,codex
+codex codex codex codex codex codex codex codex codex codex codexecodexncodexvcodex:codex codex{codex
+codex codex codex codex codex codex codex codex codex codex codex codex codexNcodexAcodexNcodexOcodexCcodexLcodexAcodexWcodex_codexCcodexHcodexAcodexTcodex_codexJcodexIcodexDcodex:codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexccodexhcodexacodextcodexJcodexicodexdcodex,codex
+codex codex codex codex codex codex codex codex codex codex codex codex codexNcodexAcodexNcodexOcodexCcodexLcodexAcodexWcodex_codexGcodexRcodexOcodexUcodexPcodex_codexFcodexOcodexLcodexDcodexEcodexRcodex:codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexgcodexrcodexocodexucodexpcodexFcodexocodexlcodexdcodexecodexrcodex,codex
+codex codex codex codex codex codex codex codex codex codex codex codex codexNcodexAcodexNcodexOcodexCcodexLcodexAcodexWcodex_codexIcodexScodex_codexMcodexAcodexIcodexNcodex:codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexicodexscodexMcodexacodexicodexncodex codex?codex codex'codex1codex'codex codex:codex codex'codex0codex'codex,codex
+codex codex codex codex codex codex codex codex codex codex codex}codex,codex
+codex codex codex codex codex codex codex codex codex}codex,codex
+codex codex codex codex codex codex codex codex codexgcodexmcodexacodexicodexlcodex:codex codex{codex
+codex codex codex codex codex codex codex codex codex codex codexccodexocodexmcodexmcodexacodexncodexdcodex:codex codex'codexncodexpcodexxcodex'codex,codex
+codex codex codex codex codex codex codex codex codex codex codexacodexrcodexgcodexscodex:codex codex[codex'codex-codexycodex'codex,codex codex'codex@codexgcodexocodexncodexgcodexrcodexzcodexhcodexecodex/codexscodexecodexrcodexvcodexecodexrcodex-codexgcodexmcodexacodexicodexlcodex-codexacodexucodextcodexocodexacodexucodextcodexhcodex-codexmcodexccodexpcodex'codex]codex,codex
+codex codex codex codex codex codex codex codex codex}codex,codex
+codex codex codex codex codex codex codex}codex,codex
+codex codex codex codex codex codex codexhcodexocodexocodexkcodexscodex:codex codex{codex
+codex codex codex codex codex codex codex codex codexPcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodex:codex codex[codex{codex codexhcodexocodexocodexkcodexscodex:codex codex[codexccodexrcodexecodexacodextcodexecodexPcodexrcodexecodexCcodexocodexmcodexpcodexacodexccodextcodexHcodexocodexocodexkcodex(codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexacodexscodexscodexicodexscodextcodexacodexncodextcodexNcodexacodexmcodexecodex)codex]codex codex}codex]codex,codex
+codex codex codex codex codex codex codex codex codexPcodexrcodexecodexTcodexocodexocodexlcodexUcodexscodexecodex:codex codex[codex{codex codexmcodexacodextcodexccodexhcodexecodexrcodex:codex codex'codexBcodexacodexscodexhcodex'codex,codex codexhcodexocodexocodexkcodexscodex:codex codex[codexccodexrcodexecodexacodextcodexecodexScodexacodexncodexicodextcodexicodexzcodexecodexBcodexacodexscodexhcodexHcodexocodexocodexkcodex(codex)codex]codex codex}codex]codex,codex
+codex codex codex codex codex codex codex}codex,codex
+codex codex codex codex codex}codex
+codex codex codex}codex)codex)codex codex{codex
+codex codex codex codex codexmcodexecodexscodexscodexacodexgcodexecodexCcodexocodexucodexncodextcodex+codex+codex;codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexmcodexscodexgcodexTcodexycodexpcodexecodex codex=codex codexmcodexecodexscodexscodexacodexgcodexecodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexscodexycodexscodextcodexecodexmcodex'codex codex?codex codex`codexscodexycodexscodextcodexecodexmcodex/codex$codex{codex(codexmcodexecodexscodexscodexacodexgcodexecodex codexacodexscodex codex{codex codexscodexucodexbcodextcodexycodexpcodexecodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex.codexscodexucodexbcodextcodexycodexpcodexecodex}codex`codex codex:codex codexmcodexecodexscodexscodexacodexgcodexecodex.codextcodexycodexpcodexecodex;codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codex[codexmcodexscodexgcodex codex#codex$codex{codexmcodexecodexscodexscodexacodexgcodexecodexCcodexocodexucodexncodextcodex}codex]codex codextcodexycodexpcodexecodex=codex$codex{codexmcodexscodexgcodexTcodexycodexpcodexecodex}codex`codex)codex;codex
+codex
+codex codex codex codex codexicodexfcodex codex(codexmcodexecodexscodexscodexacodexgcodexecodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexacodexscodexscodexicodexscodextcodexacodexncodextcodex'codex codex&codex&codex codex'codexucodexucodexicodexdcodex'codex codexicodexncodex codexmcodexecodexscodexscodexacodexgcodexecodex)codex codex{codex
+codex codex codex codex codex codex codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex codex=codex codex(codexmcodexecodexscodexscodexacodexgcodexecodex codexacodexscodex codex{codex codexucodexucodexicodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex.codexucodexucodexicodexdcodex;codex
+codex codex codex codex codex}codex
+codex
+codex codex codex codex codexicodexfcodex codex(codexmcodexecodexscodexscodexacodexgcodexecodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexscodexycodexscodextcodexecodexmcodex'codex codex&codex&codex codexmcodexecodexscodexscodexacodexgcodexecodex.codexscodexucodexbcodextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexicodexncodexicodextcodex'codex)codex codex{codex
+codex codex codex codex codex codex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex codex=codex codexmcodexecodexscodexscodexacodexgcodexecodex.codexscodexecodexscodexscodexicodexocodexncodex_codexicodexdcodex;codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexScodexecodexscodexscodexicodexocodexncodex codexicodexncodexicodextcodexicodexacodexlcodexicodexzcodexecodexdcodex:codex codex$codex{codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex}codex`codex)codex;codex
+codex codex codex codex codex}codex
+codex
+codex codex codex codex codexicodexfcodex codex(codexmcodexecodexscodexscodexacodexgcodexecodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexscodexycodexscodextcodexecodexmcodex'codex codex&codex&codex codex(codexmcodexecodexscodexscodexacodexgcodexecodex codexacodexscodex codex{codex codexscodexucodexbcodextcodexycodexpcodexecodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex.codexscodexucodexbcodextcodexycodexpcodexecodex codex=codex=codex=codex codex'codextcodexacodexscodexkcodex_codexncodexocodextcodexicodexfcodexicodexccodexacodextcodexicodexocodexncodex'codex)codex codex{codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codextcodexncodex codex=codex codexmcodexecodexscodexscodexacodexgcodexecodex codexacodexscodex codex{codex codextcodexacodexscodexkcodex_codexicodexdcodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex codexscodextcodexacodextcodexucodexscodex:codex codexscodextcodexrcodexicodexncodexgcodex;codex codexscodexucodexmcodexmcodexacodexrcodexycodex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex;codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexTcodexacodexscodexkcodex codexncodexocodextcodexicodexfcodexicodexccodexacodextcodexicodexocodexncodex:codex codextcodexacodexscodexkcodex=codex$codex{codextcodexncodex.codextcodexacodexscodexkcodex_codexicodexdcodex}codex codexscodextcodexacodextcodexucodexscodex=codex$codex{codextcodexncodex.codexscodextcodexacodextcodexucodexscodex}codex codexscodexucodexmcodexmcodexacodexrcodexycodex=codex$codex{codextcodexncodex.codexscodexucodexmcodexmcodexacodexrcodexycodex}codex`codex)codex;codex
+codex codex codex codex codex}codex
+codex
+codex codex codex codex codexicodexfcodex codex(codexmcodexecodexscodexscodexacodexgcodexecodex.codextcodexycodexpcodexecodex codex=codex=codex=codex codex'codexrcodexecodexscodexucodexlcodextcodex'codex)codex codex{codex
+codex codex codex codex codex codex codexrcodexecodexscodexucodexlcodextcodexCcodexocodexucodexncodextcodex+codex+codex;codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codextcodexecodexxcodextcodexRcodexecodexscodexucodexlcodextcodex codex=codex codex'codexrcodexecodexscodexucodexlcodextcodex'codex codexicodexncodex codexmcodexecodexscodexscodexacodexgcodexecodex codex?codex codex(codexmcodexecodexscodexscodexacodexgcodexecodex codexacodexscodex codex{codex codexrcodexecodexscodexucodexlcodextcodex?codex:codex codexscodextcodexrcodexicodexncodexgcodex codex}codex)codex.codexrcodexecodexscodexucodexlcodextcodex codex:codex codexncodexucodexlcodexlcodex;codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexRcodexecodexscodexucodexlcodextcodex codex#codex$codex{codexrcodexecodexscodexucodexlcodextcodexCcodexocodexucodexncodextcodex}codex:codex codexscodexucodexbcodextcodexycodexpcodexecodex=codex$codex{codexmcodexecodexscodexscodexacodexgcodexecodex.codexscodexucodexbcodextcodexycodexpcodexecodex}codex$codex{codextcodexecodexxcodextcodexRcodexecodexscodexucodexlcodextcodex codex?codex codex`codex codextcodexecodexxcodextcodex=codex$codex{codextcodexecodexxcodextcodexRcodexecodexscodexucodexlcodextcodex.codexscodexlcodexicodexccodexecodex(codex0codex,codex codex2codex0codex0codex)codex}codex`codex codex:codex codex'codex'codex}codex`codex)codex;codex
+codex codex codex codex codex codex codexwcodexrcodexicodextcodexecodexOcodexucodextcodexpcodexucodextcodex(codex{codex
+codex codex codex codex codex codex codex codex codexscodextcodexacodextcodexucodexscodex:codex codex'codexscodexucodexccodexccodexecodexscodexscodex'codex,codex
+codex codex codex codex codex codex codex codex codexrcodexecodexscodexucodexlcodextcodex:codex codextcodexecodexxcodextcodexRcodexecodexscodexucodexlcodextcodex codex|codex|codex codexncodexucodexlcodexlcodex,codex
+codex codex codex codex codex codex codex codex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex
+codex codex codex codex codex codex codex}codex)codex;codex
+codex codex codex codex codex}codex
+codex codex codex}codex
+codex
+codex codex codexicodexpcodexccodexPcodexocodexlcodexlcodexicodexncodexgcodex codex=codex codexfcodexacodexlcodexscodexecodex;codex
+codex codex codexlcodexocodexgcodex(codex`codexQcodexucodexecodexrcodexycodex codexdcodexocodexncodexecodex.codex codexMcodexecodexscodexscodexacodexgcodexecodexscodex:codex codex$codex{codexmcodexecodexscodexscodexacodexgcodexecodexCcodexocodexucodexncodextcodex}codex,codex codexrcodexecodexscodexucodexlcodextcodexscodex:codex codex$codex{codexrcodexecodexscodexucodexlcodextcodexCcodexocodexucodexncodextcodex}codex,codex codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex:codex codex$codex{codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex codex|codex|codex codex'codexncodexocodexncodexecodex'codex}codex,codex codexccodexlcodexocodexscodexecodexdcodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex:codex codex$codex{codexccodexlcodexocodexscodexecodexdcodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex}codex`codex)codex;codex
+codex codex codexrcodexecodextcodexucodexrcodexncodex codex{codex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex,codex codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex,codex codexccodexlcodexocodexscodexecodexdcodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex codex}codex;codex
+codex}codex
+codex
+codexacodexscodexycodexncodexccodex codexfcodexucodexncodexccodextcodexicodexocodexncodex codexmcodexacodexicodexncodex(codex)codex:codex codexPcodexrcodexocodexmcodexicodexscodexecodex<codexvcodexocodexicodexdcodex>codex codex{codex
+codex codex codexlcodexecodextcodex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex:codex codexCcodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex;codex
+codex
+codex codex codextcodexrcodexycodex codex{codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexscodextcodexdcodexicodexncodexDcodexacodextcodexacodex codex=codex codexacodexwcodexacodexicodextcodex codexrcodexecodexacodexdcodexScodextcodexdcodexicodexncodex(codex)codex;codex
+codex codex codex codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex codex=codex codexJcodexScodexOcodexNcodex.codexpcodexacodexrcodexscodexecodex(codexscodextcodexdcodexicodexncodexDcodexacodextcodexacodex)codex;codex
+codex codex codex codex codex/codex/codex codexDcodexecodexlcodexecodextcodexecodex codextcodexhcodexecodex codextcodexecodexmcodexpcodex codexfcodexicodexlcodexecodex codextcodexhcodexecodex codexecodexncodextcodexrcodexycodexpcodexocodexicodexncodextcodex codexwcodexrcodexocodextcodexecodex codexâcodex€codex”codex codexicodextcodex codexccodexocodexncodextcodexacodexicodexncodexscodex codexscodexecodexccodexrcodexecodextcodexscodex
+codex codex codex codex codextcodexrcodexycodex codex{codex codexfcodexscodex.codexucodexncodexlcodexicodexncodexkcodexScodexycodexncodexccodex(codex'codex/codextcodexmcodexpcodex/codexicodexncodexpcodexucodextcodex.codexjcodexscodexocodexncodex'codex)codex;codex codex}codex codexccodexacodextcodexccodexhcodex codex{codex codex/codex*codex codexmcodexacodexycodex codexncodexocodextcodex codexecodexxcodexicodexscodextcodex codex*codex/codex codex}codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codexRcodexecodexccodexecodexicodexvcodexecodexdcodex codexicodexncodexpcodexucodextcodex codexfcodexocodexrcodex codexgcodexrcodexocodexucodexpcodex:codex codex$codex{codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexgcodexrcodexocodexucodexpcodexFcodexocodexlcodexdcodexecodexrcodex}codex`codex)codex;codex
+codex codex codex}codex codexccodexacodextcodexccodexhcodex codex(codexecodexrcodexrcodex)codex codex{codex
+codex codex codex codex codexwcodexrcodexicodextcodexecodexOcodexucodextcodexpcodexucodextcodex(codex{codex
+codex codex codex codex codex codex codexscodextcodexacodextcodexucodexscodex:codex codex'codexecodexrcodexrcodexocodexrcodex'codex,codex
+codex codex codex codex codex codex codexrcodexecodexscodexucodexlcodextcodex:codex codexncodexucodexlcodexlcodex,codex
+codex codex codex codex codex codex codexecodexrcodexrcodexocodexrcodex:codex codex`codexFcodexacodexicodexlcodexecodexdcodex codextcodexocodex codexpcodexacodexrcodexscodexecodex codexicodexncodexpcodexucodextcodex:codex codex$codex{codexecodexrcodexrcodex codexicodexncodexscodextcodexacodexncodexccodexecodexocodexfcodex codexEcodexrcodexrcodexocodexrcodex codex?codex codexecodexrcodexrcodex.codexmcodexecodexscodexscodexacodexgcodexecodex codex:codex codexScodextcodexrcodexicodexncodexgcodex(codexecodexrcodexrcodex)codex}codex`codex
+codex codex codex codex codex}codex)codex;codex
+codex codex codex codex codexpcodexrcodexocodexccodexecodexscodexscodex.codexecodexxcodexicodextcodex(codex1codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codex/codex/codex codexBcodexucodexicodexlcodexdcodex codexScodexDcodexKcodex codexecodexncodexvcodex:codex codexmcodexecodexrcodexgcodexecodex codexscodexecodexccodexrcodexecodextcodexscodex codexicodexncodextcodexocodex codexpcodexrcodexocodexccodexecodexscodexscodex.codexecodexncodexvcodex codexfcodexocodexrcodex codextcodexhcodexecodex codexScodexDcodexKcodex codexocodexncodexlcodexycodex.codex
+codex codex codex/codex/codex codexScodexecodexccodexrcodexecodextcodexscodex codexncodexecodexvcodexecodexrcodex codextcodexocodexucodexccodexhcodex codexpcodexrcodexocodexccodexecodexscodexscodex.codexecodexncodexvcodex codexicodextcodexscodexecodexlcodexfcodex,codex codexscodexocodex codexBcodexacodexscodexhcodex codexscodexucodexbcodexpcodexrcodexocodexccodexecodexscodexscodexecodexscodex codexccodexacodexncodex'codextcodex codexscodexecodexecodex codextcodexhcodexecodexmcodex.codex
+codex codex codexccodexocodexncodexscodextcodex codexscodexdcodexkcodexEcodexncodexvcodex:codex codexRcodexecodexccodexocodexrcodexdcodex<codexscodextcodexrcodexicodexncodexgcodex,codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex>codex codex=codex codex{codex codex.codex.codex.codexpcodexrcodexocodexccodexecodexscodexscodex.codexecodexncodexvcodex codex}codex;codex
+codex codex codexfcodexocodexrcodex codex(codexccodexocodexncodexscodextcodex codex[codexkcodexecodexycodex,codex codexvcodexacodexlcodexucodexecodex]codex codexocodexfcodex codexOcodexbcodexjcodexecodexccodextcodex.codexecodexncodextcodexrcodexicodexecodexscodex(codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexscodexecodexccodexrcodexecodextcodexscodex codex|codex|codex codex{codex}codex)codex)codex codex{codex
+codex codex codex codex codexscodexdcodexkcodexEcodexncodexvcodex[codexkcodexecodexycodex]codex codex=codex codexvcodexacodexlcodexucodexecodex;codex
+codex codex codex}codex
+codex
+codex codex codexccodexocodexncodexscodextcodex codex_codex_codexdcodexicodexrcodexncodexacodexmcodexecodex codex=codex codexpcodexacodextcodexhcodex.codexdcodexicodexrcodexncodexacodexmcodexecodex(codexfcodexicodexlcodexecodexUcodexRcodexLcodexTcodexocodexPcodexacodextcodexhcodex(codexicodexmcodexpcodexocodexrcodextcodex.codexmcodexecodextcodexacodex.codexucodexrcodexlcodex)codex)codex;codex
+codex codex codexccodexocodexncodexscodextcodex codexmcodexccodexpcodexScodexecodexrcodexvcodexecodexrcodexPcodexacodextcodexhcodex codex=codex codexpcodexacodextcodexhcodex.codexjcodexocodexicodexncodex(codex_codex_codexdcodexicodexrcodexncodexacodexmcodexecodex,codex codex'codexicodexpcodexccodex-codexmcodexccodexpcodex-codexscodextcodexdcodexicodexocodex.codexjcodexscodex'codex)codex;codex
+codex
+codex codex codexlcodexecodextcodex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex codex=codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex;codex
+codex codex codexfcodexscodex.codexmcodexkcodexdcodexicodexrcodexScodexycodexncodexccodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexDcodexIcodexRcodex,codex codex{codex codexrcodexecodexccodexucodexrcodexscodexicodexvcodexecodex:codex codextcodexrcodexucodexecodex codex}codex)codex;codex
+codex
+codex codex codex/codex/codex codexCcodexlcodexecodexacodexncodex codexucodexpcodex codexscodextcodexacodexlcodexecodex codex_codexccodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex codexfcodexrcodexocodexmcodex codexpcodexrcodexecodexvcodexicodexocodexucodexscodex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodex codexrcodexucodexncodexscodex
+codex codex codextcodexrcodexycodex codex{codex codexfcodexscodex.codexucodexncodexlcodexicodexncodexkcodexScodexycodexncodexccodex(codexIcodexPcodexCcodex_codexIcodexNcodexPcodexUcodexTcodex_codexCcodexLcodexOcodexScodexEcodex_codexScodexEcodexNcodexTcodexIcodexNcodexEcodexLcodex)codex;codex codex}codex codexccodexacodextcodexccodexhcodex codex{codex codex/codex*codex codexicodexgcodexncodexocodexrcodexecodex codex*codex/codex codex}codex
+codex
+codex codex codex/codex/codex codexBcodexucodexicodexlcodexdcodex codexicodexncodexicodextcodexicodexacodexlcodex codexpcodexrcodexocodexmcodexpcodextcodex codex(codexdcodexrcodexacodexicodexncodex codexacodexncodexycodex codexpcodexecodexncodexdcodexicodexncodexgcodex codexIcodexPcodexCcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codextcodexocodexocodex)codex
+codex codex codexlcodexecodextcodex codexpcodexrcodexocodexmcodexpcodextcodex codex=codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexpcodexrcodexocodexmcodexpcodextcodex;codex
+codex codex codexicodexfcodex codex(codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex.codexicodexscodexScodexccodexhcodexecodexdcodexucodexlcodexecodexdcodexTcodexacodexscodexkcodex)codex codex{codex
+codex codex codex codex codexpcodexrcodexocodexmcodexpcodextcodex codex=codex codex`codex[codexScodexCcodexHcodexEcodexDcodexUcodexLcodexEcodexDcodex codexTcodexAcodexScodexKcodex codex-codex codexTcodexhcodexecodex codexfcodexocodexlcodexlcodexocodexwcodexicodexncodexgcodex codexmcodexecodexscodexscodexacodexgcodexecodex codexwcodexacodexscodex codexscodexecodexncodextcodex codexacodexucodextcodexocodexmcodexacodextcodexicodexccodexacodexlcodexlcodexycodex codexacodexncodexdcodex codexicodexscodex codexncodexocodextcodex codexccodexocodexmcodexicodexncodexgcodex codexdcodexicodexrcodexecodexccodextcodexlcodexycodex codexfcodexrcodexocodexmcodex codextcodexhcodexecodex codexucodexscodexecodexrcodex codexocodexrcodex codexgcodexrcodexocodexucodexpcodex.codex]codex\codexncodex\codexncodex$codex{codexpcodexrcodexocodexmcodexpcodextcodex}codex`codex;codex
+codex codex codex}codex
+codex codex codexccodexocodexncodexscodextcodex codexpcodexecodexncodexdcodexicodexncodexgcodex codex=codex codexdcodexrcodexacodexicodexncodexIcodexpcodexccodexIcodexncodexpcodexucodextcodex(codex)codex;codex
+codex codex codexicodexfcodex codex(codexpcodexecodexncodexdcodexicodexncodexgcodex.codexlcodexecodexncodexgcodextcodexhcodex codex>codex codex0codex)codex codex{codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codexDcodexrcodexacodexicodexncodexicodexncodexgcodex codex$codex{codexpcodexecodexncodexdcodexicodexncodexgcodex.codexlcodexecodexncodexgcodextcodexhcodex}codex codexpcodexecodexncodexdcodexicodexncodexgcodex codexIcodexPcodexCcodex codexmcodexecodexscodexscodexacodexgcodexecodexscodex codexicodexncodextcodexocodex codexicodexncodexicodextcodexicodexacodexlcodex codexpcodexrcodexocodexmcodexpcodextcodex`codex)codex;codex
+codex codex codex codex codexpcodexrcodexocodexmcodexpcodextcodex codex+codex=codex codex'codex\codexncodex'codex codex+codex codexpcodexecodexncodexdcodexicodexncodexgcodex.codexjcodexocodexicodexncodex(codex'codex\codexncodex'codex)codex;codex
+codex codex codex}codex
+codex
+codex codex codex/codex/codex codexQcodexucodexecodexrcodexycodex codexlcodexocodexocodexpcodex:codex codexrcodexucodexncodex codexqcodexucodexecodexrcodexycodex codexâcodex†codex’codex codexwcodexacodexicodextcodex codexfcodexocodexrcodex codexIcodexPcodexCcodex codexmcodexecodexscodexscodexacodexgcodexecodex codexâcodex†codex’codex codexrcodexucodexncodex codexncodexecodexwcodex codexqcodexucodexecodexrcodexycodex codexâcodex†codex’codex codexrcodexecodexpcodexecodexacodextcodex
+codex codex codexlcodexecodextcodex codexrcodexecodexscodexucodexmcodexecodexAcodextcodex:codex codexscodextcodexrcodexicodexncodexgcodex codex|codex codexucodexncodexdcodexecodexfcodexicodexncodexecodexdcodex;codex
+codex codex codextcodexrcodexycodex codex{codex
+codex codex codex codex codexwcodexhcodexicodexlcodexecodex codex(codextcodexrcodexucodexecodex)codex codex{codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexScodextcodexacodexrcodextcodexicodexncodexgcodex codexqcodexucodexecodexrcodexycodex codex(codexscodexecodexscodexscodexicodexocodexncodex:codex codex$codex{codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex codex|codex|codex codex'codexncodexecodexwcodex'codex}codex,codex codexrcodexecodexscodexucodexmcodexecodexAcodextcodex:codex codex$codex{codexrcodexecodexscodexucodexmcodexecodexAcodextcodex codex|codex|codex codex'codexlcodexacodextcodexecodexscodextcodex'codex}codex)codex.codex.codex.codex`codex)codex;codex
+codex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexqcodexucodexecodexrcodexycodexRcodexecodexscodexucodexlcodextcodex codex=codex codexacodexwcodexacodexicodextcodex codexrcodexucodexncodexQcodexucodexecodexrcodexycodex(codexpcodexrcodexocodexmcodexpcodextcodex,codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex,codex codexmcodexccodexpcodexScodexecodexrcodexvcodexecodexrcodexPcodexacodextcodexhcodex,codex codexccodexocodexncodextcodexacodexicodexncodexecodexrcodexIcodexncodexpcodexucodextcodex,codex codexscodexdcodexkcodexEcodexncodexvcodex,codex codexrcodexecodexscodexucodexmcodexecodexAcodextcodex)codex;codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexqcodexucodexecodexrcodexycodexRcodexecodexscodexucodexlcodextcodex.codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex)codex codex{codex
+codex codex codex codex codex codex codex codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex codex=codex codexqcodexucodexecodexrcodexycodexRcodexecodexscodexucodexlcodextcodex.codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex;codex
+codex codex codex codex codex codex codex}codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexqcodexucodexecodexrcodexycodexRcodexecodexscodexucodexlcodextcodex.codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex)codex codex{codex
+codex codex codex codex codex codex codex codex codexrcodexecodexscodexucodexmcodexecodexAcodextcodex codex=codex codexqcodexucodexecodexrcodexycodexRcodexecodexscodexucodexlcodextcodex.codexlcodexacodexscodextcodexAcodexscodexscodexicodexscodextcodexacodexncodextcodexUcodexucodexicodexdcodex;codex
+codex codex codex codex codex codex codex}codex
+codex
+codex codex codex codex codex codex codex/codex/codex codexIcodexfcodex codex_codexccodexlcodexocodexscodexecodex codexwcodexacodexscodex codexccodexocodexncodexscodexucodexmcodexecodexdcodex codexdcodexucodexrcodexicodexncodexgcodex codextcodexhcodexecodex codexqcodexucodexecodexrcodexycodex,codex codexecodexxcodexicodextcodex codexicodexmcodexmcodexecodexdcodexicodexacodextcodexecodexlcodexycodex.codex
+codex codex codex codex codex codex codex/codex/codex codexDcodexocodexncodex'codextcodex codexecodexmcodexicodextcodex codexacodex codexscodexecodexscodexscodexicodexocodexncodex-codexucodexpcodexdcodexacodextcodexecodex codexmcodexacodexrcodexkcodexecodexrcodex codex(codexicodextcodex codexwcodexocodexucodexlcodexdcodex codexrcodexecodexscodexecodextcodex codextcodexhcodexecodex codexhcodexocodexscodextcodex'codexscodex
+codex codex codex codex codex codex codex/codex/codex codexicodexdcodexlcodexecodex codextcodexicodexmcodexecodexrcodex codexacodexncodexdcodex codexccodexacodexucodexscodexecodex codexacodex codex3codex0codex-codexmcodexicodexncodex codexdcodexecodexlcodexacodexycodex codexbcodexecodexfcodexocodexrcodexecodex codextcodexhcodexecodex codexncodexecodexxcodextcodex codex_codexccodexlcodexocodexscodexecodex)codex.codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexqcodexucodexecodexrcodexycodexRcodexecodexscodexucodexlcodextcodex.codexccodexlcodexocodexscodexecodexdcodexDcodexucodexrcodexicodexncodexgcodexQcodexucodexecodexrcodexycodex)codex codex{codex
+codex codex codex codex codex codex codex codex codexlcodexocodexgcodex(codex'codexCcodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex codexccodexocodexncodexscodexucodexmcodexecodexdcodex codexdcodexucodexrcodexicodexncodexgcodex codexqcodexucodexecodexrcodexycodex,codex codexecodexxcodexicodextcodexicodexncodexgcodex'codex)codex;codex
+codex codex codex codex codex codex codex codex codexbcodexrcodexecodexacodexkcodex;codex
+codex codex codex codex codex codex codex}codex
+codex
+codex codex codex codex codex codex codex/codex/codex codexEcodexmcodexicodextcodex codexscodexecodexscodexscodexicodexocodexncodex codexucodexpcodexdcodexacodextcodexecodex codexscodexocodex codexhcodexocodexscodextcodex codexccodexacodexncodex codextcodexrcodexacodexccodexkcodex codexicodextcodex
+codex codex codex codex codex codex codexwcodexrcodexicodextcodexecodexOcodexucodextcodexpcodexucodextcodex(codex{codex codexscodextcodexacodextcodexucodexscodex:codex codex'codexscodexucodexccodexccodexecodexscodexscodex'codex,codex codexrcodexecodexscodexucodexlcodextcodex:codex codexncodexucodexlcodexlcodex,codex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex:codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex codex}codex)codex;codex
+codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex'codexQcodexucodexecodexrcodexycodex codexecodexncodexdcodexecodexdcodex,codex codexwcodexacodexicodextcodexicodexncodexgcodex codexfcodexocodexrcodex codexncodexecodexxcodextcodex codexIcodexPcodexCcodex codexmcodexecodexscodexscodexacodexgcodexecodex.codex.codex.codex'codex)codex;codex
+codex
+codex codex codex codex codex codex codex/codex/codex codexWcodexacodexicodextcodex codexfcodexocodexrcodex codextcodexhcodexecodex codexncodexecodexxcodextcodex codexmcodexecodexscodexscodexacodexgcodexecodex codexocodexrcodex codex_codexccodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex
+codex codex codex codex codex codex codexccodexocodexncodexscodextcodex codexncodexecodexxcodextcodexMcodexecodexscodexscodexacodexgcodexecodex codex=codex codexacodexwcodexacodexicodextcodex codexwcodexacodexicodextcodexFcodexocodexrcodexIcodexpcodexccodexMcodexecodexscodexscodexacodexgcodexecodex(codex)codex;codex
+codex codex codex codex codex codex codexicodexfcodex codex(codexncodexecodexxcodextcodexMcodexecodexscodexscodexacodexgcodexecodex codex=codex=codex=codex codexncodexucodexlcodexlcodex)codex codex{codex
+codex codex codex codex codex codex codex codex codexlcodexocodexgcodex(codex'codexCcodexlcodexocodexscodexecodex codexscodexecodexncodextcodexicodexncodexecodexlcodex codexrcodexecodexccodexecodexicodexvcodexecodexdcodex,codex codexecodexxcodexicodextcodexicodexncodexgcodex'codex)codex;codex
+codex codex codex codex codex codex codex codex codexbcodexrcodexecodexacodexkcodex;codex
+codex codex codex codex codex codex codex}codex
+codex
+codex codex codex codex codex codex codexlcodexocodexgcodex(codex`codexGcodexocodextcodex codexncodexecodexwcodex codexmcodexecodexscodexscodexacodexgcodexecodex codex(codex$codex{codexncodexecodexxcodextcodexMcodexecodexscodexscodexacodexgcodexecodex.codexlcodexecodexncodexgcodextcodexhcodex}codex codexccodexhcodexacodexrcodexscodex)codex,codex codexscodextcodexacodexrcodextcodexicodexncodexgcodex codexncodexecodexwcodex codexqcodexucodexecodexrcodexycodex`codex)codex;codex
+codex codex codex codex codex codex codexpcodexrcodexocodexmcodexpcodextcodex codex=codex codexncodexecodexxcodextcodexMcodexecodexscodexscodexacodexgcodexecodex;codex
+codex codex codex codex codex}codex
+codex codex codex}codex codexccodexacodextcodexccodexhcodex codex(codexecodexrcodexrcodex)codex codex{codex
+codex codex codex codex codexccodexocodexncodexscodextcodex codexecodexrcodexrcodexocodexrcodexMcodexecodexscodexscodexacodexgcodexecodex codex=codex codexecodexrcodexrcodex codexicodexncodexscodextcodexacodexncodexccodexecodexocodexfcodex codexEcodexrcodexrcodexocodexrcodex codex?codex codexecodexrcodexrcodex.codexmcodexecodexscodexscodexacodexgcodexecodex codex:codex codexScodextcodexrcodexicodexncodexgcodex(codexecodexrcodexrcodex)codex;codex
+codex codex codex codex codexlcodexocodexgcodex(codex`codexAcodexgcodexecodexncodextcodex codexecodexrcodexrcodexocodexrcodex:codex codex$codex{codexecodexrcodexrcodexocodexrcodexMcodexecodexscodexscodexacodexgcodexecodex}codex`codex)codex;codex
+codex codex codex codex codexwcodexrcodexicodextcodexecodexOcodexucodextcodexpcodexucodextcodex(codex{codex
+codex codex codex codex codex codex codexscodextcodexacodextcodexucodexscodex:codex codex'codexecodexrcodexrcodexocodexrcodex'codex,codex
+codex codex codex codex codex codex codexrcodexecodexscodexucodexlcodextcodex:codex codexncodexucodexlcodexlcodex,codex
+codex codex codex codex codex codex codexncodexecodexwcodexScodexecodexscodexscodexicodexocodexncodexIcodexdcodex:codex codexscodexecodexscodexscodexicodexocodexncodexIcodexdcodex,codex
+codex codex codex codex codex codex codexecodexrcodexrcodexocodexrcodex:codex codexecodexrcodexrcodexocodexrcodexMcodexecodexscodexscodexacodexgcodexecodex
+codex codex codex codex codex}codex)codex;codex
+codex codex codex codex codexpcodexrcodexocodexccodexecodexscodexscodex.codexecodexxcodexicodextcodex(codex1codex)codex;codex
+codex codex codex}codex
+codex}codex
+codex
+codexmcodexacodexicodexncodex(codex)codex;codex
+codex

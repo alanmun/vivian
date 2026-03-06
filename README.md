@@ -14,7 +14,7 @@
 </p>
 Using Codex, NanoClaw can dynamically rewrite its code to customize its feature set for your needs.
 
-**New:** First AI assistant to support [Agent Swarms](https://code.claude.com/docs/en/agent-teams). Spin up teams of agents that collaborate in your chat.
+**New:** First AI assistant to support agent swarms. Spin up teams of agents that collaborate in your chat.
 
 ## Why I Built NanoClaw
 
@@ -51,16 +51,16 @@ Then have Codex run the setup flow in `.agents/skills/setup/SKILL.md`, or run th
 - No monitoring dashboard; ask the agent what's happening.
 - No debugging tools; describe the problem and the agent fixes it.
 
-**Skills over features.** Instead of adding features (e.g. support for Telegram) to the codebase, contributors submit [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
+**Skills over features.** Instead of adding features (e.g. support for Telegram) to the codebase, contributors submit skills like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
 
 **Best harness, best model.** This experimental branch runs Codex in the container harness for coding and problem-solving tasks, and is designed to be modified by the agent as you customize your fork.
 
 ## What It Supports
 
 - **Multi-channel messaging** - Talk to your assistant from WhatsApp, Telegram, Discord, Slack, or Gmail. Add channels with skills like `/add-whatsapp` or `/add-telegram`. Run one or many at the same time.
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted to it.
+- **Isolated group context** - Every group gets base context from root `SOUL.md`, can add group-specific context via `groups/{group}/SOUL.md`, and runs in its own container sandbox with isolated workspace mounts.
 - **Main channel** - Your private channel (self-chat) for admin control; every group is completely isolated
-- **Scheduled tasks** - Recurring jobs that run Claude and can message you back
+- **Scheduled tasks** - Recurring jobs that run the agent and can message you back
 - **Web access** - Search and fetch content from the Web
 - **Container isolation** - Agents are sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks. NanoClaw is the first personal AI assistant to support agent swarms.
@@ -83,6 +83,42 @@ From the main channel (your self-chat), you can manage groups and tasks:
 @Andy join the Family Chat group
 ```
 
+### Run and Control NanoClaw
+
+On Linux (`systemd --user`), use:
+
+```bash
+# Start
+systemctl --user start nanoclaw
+
+# Stop
+systemctl --user stop nanoclaw
+
+# Restart
+systemctl --user restart nanoclaw
+
+# Status
+systemctl --user status nanoclaw --no-pager -n 40
+
+# Logs
+tail -f logs/nanoclaw.log
+
+# Full agent audit log (daily, all groups)
+tail -f data/vivian-audit/$(date +%F).log
+```
+
+After code changes (single command):
+
+```bash
+npm run rebuild
+```
+
+Optional fast path (skip container rebuild when only host TS changed):
+
+```bash
+bash scripts/rebuild-nanoclaw.sh --skip-container
+```
+
 ## Customizing
 
 NanoClaw doesn't use configuration files. To make changes, just tell Codex what you want:
@@ -100,7 +136,7 @@ The codebase is small enough that the agent can safely modify it.
 
 **Don't add features. Add skills.**
 
-If you want to add Telegram support, don't create a PR that adds Telegram alongside WhatsApp. Instead, contribute a skill file (`.agents/skills/add-telegram/SKILL.md`) that teaches Claude Code how to transform a NanoClaw installation to use Telegram.
+If you want to add Telegram support, don't create a PR that adds Telegram alongside WhatsApp. Instead, contribute a skill file (`.agents/skills/add-telegram/SKILL.md`) that teaches the coding agent how to transform a NanoClaw installation to use Telegram.
 
 Users then run `/add-telegram` on their fork and get clean code that does exactly what they need, not a bloated system trying to support every use case.
 
@@ -112,7 +148,7 @@ Skills we'd like to see:
 - `/add-signal` - Add Signal as a channel
 
 **Session Management**
-- `/clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the Claude Agent SDK.
+- `/clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session).
 
 ## Requirements
 
@@ -124,7 +160,7 @@ Skills we'd like to see:
 ## Architecture
 
 ```
-Channels --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+Channels --> SQLite --> Polling loop --> Container (Codex runtime) --> Response
 ```
 
 Single Node.js process. Channels are added via skills and self-register at startup — the orchestrator connects whichever ones have credentials present. Agents execute in isolated Linux containers with filesystem isolation. Only mounted directories are accessible. Per-group message queue with concurrency control. IPC via filesystem.
@@ -140,7 +176,8 @@ Key files:
 - `src/container-runner.ts` - Spawns streaming agent containers
 - `src/task-scheduler.ts` - Runs scheduled tasks
 - `src/db.ts` - SQLite operations (messages, groups, sessions, state)
-- `groups/*/CLAUDE.md` - Per-group memory
+- `SOUL.md` - Base behavior/memory loaded for all groups
+- `groups/*/SOUL.md` - Per-group memory
 
 ## FAQ
 
@@ -158,7 +195,7 @@ Agents run in containers, not behind application-level permission checks. They c
 
 **Why no configuration files?**
 
-We don't want configuration sprawl. Every user should customize NanoClaw so that the code does exactly what they want, rather than configuring a generic system. If you prefer having config files, you can tell Claude to add them.
+We don't want configuration sprawl. Every user should customize NanoClaw so that the code does exactly what they want, rather than configuring a generic system. If you prefer having config files, you can ask the coding agent to add them.
 
 **Can I use third-party or open-source models?**
 

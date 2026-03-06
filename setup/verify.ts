@@ -107,18 +107,12 @@ export async function run(_args: string[]): Promise<void> {
   const authVars = readEnvFile([
     'CODEX_API_KEY',
     'OPENAI_API_KEY',
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_API_KEY',
   ]);
   if (
     process.env.CODEX_API_KEY ||
     authVars.CODEX_API_KEY ||
     process.env.OPENAI_API_KEY ||
-    authVars.OPENAI_API_KEY ||
-    process.env.CLAUDE_CODE_OAUTH_TOKEN ||
-    authVars.CLAUDE_CODE_OAUTH_TOKEN ||
-    process.env.ANTHROPIC_API_KEY ||
-    authVars.ANTHROPIC_API_KEY
+    authVars.OPENAI_API_KEY
   ) {
     credentials = 'configured';
   }

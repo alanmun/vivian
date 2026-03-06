@@ -91,7 +91,7 @@ jobs:
 
             ### What to do
 
-            1. Review the changes to `.claude/skills/*/modify/` files
+            1. Review the changes to `.agents/skills/*/modify/` files
             2. If there are conflict markers (`<<<<<<<`), resolve them
             3. CI will run typecheck + tests on this PR automatically
             4. Merge when green

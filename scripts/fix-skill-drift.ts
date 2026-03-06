@@ -7,7 +7,7 @@
  *   2. Retrieve the source file at that commit (old base)
  *   3. git merge-file <modify/file> <old_base> <current_main>
  *      - Clean merge → modify/ file is auto-updated
- *      - Conflicts   → conflict markers left in place for human/Claude review
+ *      - Conflicts   → conflict markers left in place for human/agent review
  *
  * The calling workflow should commit the resulting changes and create a PR.
  *
@@ -42,7 +42,7 @@ function readManifest(skillDir: string): SkillManifest {
 }
 
 function fixSkill(skillName: string, projectRoot: string): FixResult[] {
-  const skillDir = path.join(projectRoot, '.claude', 'skills', skillName);
+  const skillDir = path.join(projectRoot, '.agents', 'skills', skillName);
   const manifest = readManifest(skillDir);
   const results: FixResult[] = [];
 

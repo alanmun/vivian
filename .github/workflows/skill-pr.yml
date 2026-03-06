@@ -4,13 +4,13 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - '.claude/skills/**'
+      - '.agents/skills/**'
       - 'skills-engine/**'
 
 jobs:
   # ── Job 1: Policy gate ────────────────────────────────────────────────
   # Block PRs that add NEW skill files while also modifying source code.
-  # Skill PRs should contain instructions for Claude, not raw source edits.
+  # Skill PRs should contain instructions for agent, not raw source edits.
   policy-check:
     runs-on: ubuntu-latest
     steps:
@@ -21,7 +21,7 @@ jobs:
       - name: Check for mixed skill + source changes
         run: |
           ADDED_SKILLS=$(git diff --name-only --diff-filter=A origin/main...HEAD \
-            | grep '^\\.claude/skills/' || true)
+            | grep '^\\.agents/skills/' || true)
           CHANGED=$(git diff --name-only origin/main...HEAD)
           SOURCE=$(echo "$CHANGED" \
             | grep -E '^src/|^container/|^package\.json|^package-lock\.json' || true)
@@ -48,7 +48,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `This PR adds a skill while also modifying source code. A skill PR should not change source files—the skill should contain **instructions** for Claude to follow.
+              body: `This PR adds a skill while also modifying source code. A skill PR should not change source files—the skill should contain **instructions** for agent to follow.
 
             If you're fixing a bug or simplifying code, please submit that as a separate PR.
 
@@ -70,8 +70,8 @@ jobs:
         id: detect
         run: |
           CHANGED_SKILLS=$(git diff --name-only origin/main...HEAD \
-            | grep '^\\.claude/skills/' \
-            | sed 's|^\.claude/skills/||' \
+            | grep '^\\.agents/skills/' \
+            | sed 's|^\.agents/skills/||' \
             | cut -d/ -f1 \
             | sort -u \
             | jq -R . | jq -s .)
@@ -106,7 +106,7 @@ jobs:
           "import { initNanoclawDir } from './skills-engine/index'; initNanoclawDir();"
 
       - name: Apply skill
-        run: npx tsx scripts/apply-skill.ts ".claude/skills/${{ matrix.skill }}"
+        run: npx tsx scripts/apply-skill.ts ".agents/skills/${{ matrix.skill }}"
 
       - name: Typecheck after apply
         run: npx tsc --noEmit
@@ -116,7 +116,7 @@ jobs:
           TEST_CMD=$(npx tsx -e "
             import { parse } from 'yaml';
             import fs from 'fs';
-            const m = parse(fs.readFileSync('.claude/skills/${{ matrix.skill }}/manifest.yaml', 'utf-8'));
+            const m = parse(fs.readFileSync('.agents/skills/${{ matrix.skill }}/manifest.yaml', 'utf-8'));
             if (m.test) console.log(m.test);
           ")
           if [ -n "$TEST_CMD" ]; then

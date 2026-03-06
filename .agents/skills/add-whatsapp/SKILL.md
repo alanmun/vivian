@@ -162,12 +162,12 @@ AskUserQuestion: Is this a shared phone number (personal WhatsApp) or a dedicate
 AskUserQuestion: What trigger word should activate the assistant?
 - **@Andy** - Default trigger
 - **@Claw** - Short and easy
-- **@Claude** - Match the AI name
+- **@agent** - Match the AI name
 
 AskUserQuestion: What should the assistant call itself?
 - **Andy** - Default name
 - **Claw** - Short and easy
-- **Claude** - Match the AI name
+- **agent** - Match the AI name
 
 AskUserQuestion: Where do you want to chat with the assistant?
 
