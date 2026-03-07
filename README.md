@@ -1,24 +1,12 @@
-<p align="center">
-  <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
-</p>
+# Vivian
 
-<p align="center">
-  An AI assistant that runs agents securely in their own containers. Lightweight, built to be easily understood and completely customized for your needs.
-</p>
-
-<p align="center">
-  <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
-  <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
-</p>
-Using Codex, NanoClaw can dynamically rewrite its code to customize its feature set for your needs.
-
-**New:** First AI assistant to support agent swarms. Spin up teams of agents that collaborate in your chat.
+Vivian is a NanoClaw based autonomous agent (an agent meant to run on its own without human supervision or human invocation). Vivian wraps around Codex, unlike NanoClaw, which used Claude Code. 
 
 ## Quick Start
 
 ```bash
 git clone <your-repo-url>
-cd vivian-codex-agent-sdk-migration
+cd vivian
 bash setup.sh
 npx tsx setup/index.ts --step environment
 npx tsx setup/index.ts --step container -- --runtime docker
