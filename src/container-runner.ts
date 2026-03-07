@@ -211,7 +211,7 @@ function buildVolumeMounts(
   // Shared audit log directory across all groups. Agent-runner appends
   // verbose per-day logs here so human operators can review all activity
   // (inputs, tool events, outputs) in one sequential stream.
-  const auditDir = path.join(DATA_DIR, 'vivian-audit');
+  const auditDir = path.join(projectRoot, 'logs', 'audit');
   fs.mkdirSync(auditDir, { recursive: true });
   mounts.push({
     hostPath: auditDir,
