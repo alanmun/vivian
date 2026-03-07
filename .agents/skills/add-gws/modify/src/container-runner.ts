@@ -268,7 +268,6 @@ function readSecrets(): Record<string, string> {
   return readEnvFile([
     'OPENAI_API_KEY',
     'CODEX_API_KEY',
-    'GITHUB_TOKEN',
     'OPENAI_BASE_URL',
     'OPENAI_ORG_ID',
     'OPENAI_PROJECT',

@@ -1,0 +1,13 @@
+skill: gws
+version: 1.0.0
+description: "Google Workspace CLI MCP integration via OAuth profiles"
+core_version: 0.1.0
+adds: []
+modifies:
+  - src/container-runner.ts
+  - container/agent-runner/src/index.ts
+  - container/Dockerfile
+  - .env.example
+structured: {}
+conflicts: []
+depends: []
