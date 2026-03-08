@@ -9,14 +9,15 @@ store/
 data/
 logs/
 
-# Groups - only track base structure and specific SOUL.md files
+# Groups - keep directories ignored by default
 groups/*
 !groups/main/
 !groups/global/
 groups/main/*
 groups/global/*
-!groups/main/SOUL.md
-!groups/global/SOUL.md
+
+# Memory files
+**/SOUL.md
 
 # Secrets
 *.keys.json
